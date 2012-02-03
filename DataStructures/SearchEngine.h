@@ -324,7 +324,6 @@ public:
 			}
 		}
 
-		//        INFO("-> dist " << _upperbound);
 		if ( _upperbound == INT_MAX ) {
 			return _upperbound;
 		}
