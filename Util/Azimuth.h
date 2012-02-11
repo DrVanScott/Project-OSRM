@@ -18,27 +18,35 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 or see http://www.gnu.org/licenses/agpl.txt.
  */
 
-#ifndef INPUTFILEUTIL_H_
-#define INPUTFILEUTIL_H_
 
-#include <fstream>
-#include <iostream>
 
-// Check if file exists and if it can be opened for reading with ifstream an object
-bool testDataFile(const char *filename){
-	std::ifstream in(filename, std::ios::binary);
-	if(in.fail())       {
-		std::cerr << "[error] Failed to open file " << filename << " for reading." << std::endl;
-		return false;
-	}
-	return true;
-}
-bool testDataFiles(int argc, char *argv[]){
-	for(int i = 0; i < argc; ++i) {
-		if(testDataFile(argv[i])==false)
-			return false;
-	}
-	return true;
-}
+#ifndef AZIMUTH_H_
+#define AZIMUTH_H_
 
-#endif /* INPUTFILEUTIL_H_ */
+#include <string>
+
+struct Azimuth {
+    static std::string Get(const double heading) {
+        if(heading <= 202.5) {
+            if(heading >= 0 && heading <= 22.5)
+                return "N";
+            if(heading > 22.5 && heading <= 67.5)
+                return "NE";
+            if(heading > 67.5 && heading <= 112.5)
+                return "E";
+            if(heading > 112.5 && heading <= 157.5)
+                return "SE";
+            return "S";
+        }
+        if(heading > 202.5 && heading <= 247.5)
+            return "SW";
+        if(heading > 247.5 && heading <= 292.5)
+            return "W";
+        if(heading > 292.5 && heading <= 337.5)
+            return "NW";
+        return "N";
+    }
+};
+
+
+#endif /* AZIMUTH_H_ */
