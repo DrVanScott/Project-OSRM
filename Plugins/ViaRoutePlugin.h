@@ -94,7 +94,7 @@ public:
         _Coordinate startCoord(lat1, lon1);
         _Coordinate targetCoord(lat2, lon2);
         RawRouteData rawRoute;
-
+        rawRoute.checkSum = nodeHelpDesk->GetCheckSum();
         if(false == checkCoord(startCoord) || false == checkCoord(targetCoord)) {
             reply = http::Reply::stockReply(http::Reply::badRequest);
             return;
@@ -119,14 +119,13 @@ public:
         }
         rawRoute.rawViaNodeCoordinates.push_back(targetCoord);
         vector<PhantomNode> phantomNodeVector(rawRoute.rawViaNodeCoordinates.size());
-
         for(unsigned i = 0; i < rawRoute.rawViaNodeCoordinates.size(); ++i) {
             searchEngine->FindPhantomNodeForCoordinate( rawRoute.rawViaNodeCoordinates[i], phantomNodeVector[i]);
+//            INFO("found coord [" << i << "|" << rawRoute.rawViaNodeCoordinates.size());
         }
-
         unsigned distance = 0;
         //single route or via point routing
-        if(0 == routeParameters.viaPoints.size()) {
+        if(2 == rawRoute.rawViaNodeCoordinates.size()) {
             PhantomNodes segmentPhantomNodes;
             segmentPhantomNodes.startPhantom = phantomNodeVector[0];
             segmentPhantomNodes.targetPhantom = phantomNodeVector[1];
@@ -145,14 +144,13 @@ public:
         if(INT_MAX == distance ) {
             DEBUG( "Error occurred, single path not found" );
         }
-
         reply.status = http::Reply::ok;
 
         BaseDescriptor<SearchEngine<EdgeData, StaticGraph<EdgeData> > > * desc;
         std::string JSONParameter = routeParameters.options.Find("jsonp");
         if("" != JSONParameter) {
             reply.content += JSONParameter;
-            reply.content += "(\n";
+            reply.content += "(";
         }
 
         _DescriptorConfig descriptorConfig;
@@ -197,7 +195,6 @@ public:
         desc->SetConfig(descriptorConfig);
 
         desc->Run(reply, rawRoute, phantomNodes, *searchEngine, distance);
-
         if("" != JSONParameter) {
             reply.content += ")\n";
         }

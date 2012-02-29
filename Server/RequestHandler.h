@@ -50,10 +50,17 @@ public:
 
 	void handle_request(const Request& req, Reply& rep){
 		//parse command
-	    std::string request(req.uri);
-//	    INFO( "[r] " << request );
+        std::string request(req.uri);
+//	    time_t ltime;
+//	    struct tm *Tm;
+//
+//	    ltime=time(NULL);
+//	    Tm=localtime(&ltime);
+//
+//	    INFO( Tm->tm_mday << "-" << (Tm->tm_mon < 10 ? "0" : "" )  << Tm->tm_mon << "-" << 1900+Tm->tm_year << " " << Tm->tm_hour << ":" << Tm->tm_min << ":" << Tm->tm_sec << " " <<
+//	            req.endpoint.to_string() << " " << request );
 		std::string command;
-		std::size_t firstAmpPosition = request.find_first_of("&");
+		std::size_t firstAmpPosition = request.find_first_of("?");
 		command = request.substr(1,firstAmpPosition-1);
 //		DEBUG("[debug] looking for handler for command: " << command);
 		try {
@@ -75,6 +82,15 @@ public:
 				        if("via" == p ) {
 				            if(25 >= routeParameters.viaPoints.size()) {
 				                routeParameters.viaPoints.push_back(o);
+				            }
+				        } else if("hint" == p) {
+				            routeParameters.hints.resize(routeParameters.viaPoints.size(), 0);
+				            if(routeParameters.hints.size()) {
+				                unsigned hint = 0;
+				                try {
+				                    hint = 10*boost::lexical_cast<int>(o);
+				                } catch(boost::bad_lexical_cast &) { /* do nothing since hint is initialized to 0 */}
+				                routeParameters.hints.back() = hint;
 				            }
 				        } else {
 				            routeParameters.options.Set(p, o);

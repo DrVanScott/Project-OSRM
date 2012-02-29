@@ -257,8 +257,13 @@ private:
                             }
                         }
                         if ( xmlStrEqual( k, ( const xmlChar* ) "barrier" ) == 1 ) {
-                            if ( xmlStrEqual( value, ( const xmlChar* ) "bollard" ) == 1 ){
+                            if ( xmlStrEqual( value, ( const xmlChar* ) "" ) != 1 ){
                                 node.bollard = true;
+                            }
+                        }
+                        if ( xmlStrEqual( k, ( const xmlChar* ) "highway" ) == 1 ) {
+                            if ( xmlStrEqual( value, ( const xmlChar* ) "traffic_lights" ) == 1 ){
+                                node.trafficLight = true;
                             }
                         }
                     }

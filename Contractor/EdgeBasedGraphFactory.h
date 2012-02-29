@@ -26,7 +26,12 @@
 #define EDGEBASEDGRAPHFACTORY_H_
 
 #include <boost/shared_ptr.hpp>
+#include <boost/property_tree/ptree.hpp>
+#include <boost/property_tree/ini_parser.hpp>
+
 #include <vector>
+
+#include <cstdlib>
 
 #include "../typedefs.h"
 #include "../DataStructures/DynamicGraph.h"
@@ -35,6 +40,8 @@
 #include "../DataStructures/ImportEdge.h"
 #include "../DataStructures/Percent.h"
 #include "../DataStructures/TurnInstructions.h"
+#include "../Util/BaseConfiguration.h"
+
 //#include "../Util/SRTMLookup.h"
 
 class EdgeBasedGraphFactory {
@@ -82,23 +89,33 @@ public:
     };
 
 private:
-    boost::shared_ptr<_NodeBasedDynamicGraph> _nodeBasedGraph;
-    HashTable<NodeID, bool> _bollardNodes;
-    HashTable<NodeID, bool> _trafficLights;
+    boost::shared_ptr<_NodeBasedDynamicGraph>   _nodeBasedGraph;
+    boost::unordered_map<NodeID, bool>          _barrierNodes;
+    boost::unordered_map<NodeID, bool>          _trafficLights;
 
-    std::vector<_Restriction> & inputRestrictions;
-    std::vector<NodeInfo> & inputNodeInfoList;
+    typedef std::pair<NodeID, NodeID> RestrictionSource;
+    typedef std::pair<NodeID, bool>   RestrictionTarget;
+    typedef std::vector<RestrictionTarget> EmanatingRestrictionsVector;
+    typedef boost::unordered_map<RestrictionSource, unsigned > RestrictionMap;
+    std::vector<EmanatingRestrictionsVector> _restrictionBucketVector;
+    RestrictionMap _restrictionMap;
+
+    std::vector<NodeInfo>       inputNodeInfoList;
+    int trafficSignalPenalty;
 
     std::vector<EdgeBasedEdge> edgeBasedEdges;
     std::vector<EdgeBasedNode> edgeBasedNodes;
 
+    NodeID CheckForEmanatingIsOnlyTurn(const NodeID u, const NodeID v) const;
+    bool CheckIfTurnIsRestricted(const NodeID u, const NodeID v, const NodeID w) const;
     template<class CoordinateT>
     double GetAngleBetweenTwoEdges(const CoordinateT& A, const CoordinateT& C, const CoordinateT& B) const;
 //    SRTMLookup srtmLookup;
+    unsigned numberOfTurnRestrictions;
 
 public:
     template< class InputEdgeT >
-    explicit EdgeBasedGraphFactory(int nodes, std::vector<InputEdgeT> & inputEdges, std::vector<NodeID> & _bollardNodes, std::vector<NodeID> & trafficLights, std::vector<_Restriction> & inputRestrictions, std::vector<NodeInfo> & nI, std::string & srtm);
+    explicit EdgeBasedGraphFactory(int nodes, std::vector<InputEdgeT> & inputEdges, std::vector<NodeID> & _bollardNodes, std::vector<NodeID> & trafficLights, std::vector<_Restriction> & inputRestrictions, std::vector<NodeInfo> & nI, boost::property_tree::ptree speedProfile, std::string & srtm);
     virtual ~EdgeBasedGraphFactory();
 
     void Run();

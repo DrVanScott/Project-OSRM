@@ -37,7 +37,7 @@ PngImage::PngImage():
 PngImage::PngImage(int width, int height,
                    unsigned char red, unsigned char green,
                    unsigned char blue, unsigned char alpha):
-    mImageData(0)
+    mImageData(0), mImageWidth(0), mImageHeight(0)
 {
     createImage(width, height, red, green, blue, alpha);
 }
@@ -144,10 +144,10 @@ namespace
                      int& imageWidth, int& imageHeight)
     {
         png_read_info(ptrs.read, ptrs.info);
-
-        imageData = new unsigned char[4 * ptrs.info->width * ptrs.info->height];
-        imageWidth = ptrs.info->width;
-        imageHeight = ptrs.info->height;
+		
+		imageWidth = png_get_image_width(ptrs.read, ptrs.info);
+		imageHeight = png_get_image_height(ptrs.read, ptrs.info);
+        imageData = new unsigned char[4 * imageWidth * imageHeight];
 
         png_set_expand(ptrs.read);
         png_set_filler(ptrs.read, 0xff, PNG_FILLER_AFTER);
@@ -209,7 +209,7 @@ bool PngImage::loadImage(const char* filename, bool printErrorMsg)
         return false;
     }
 
-    if(setjmp(ptrs.read->jmpbuf)) return false;
+    if(setjmp(png_jmpbuf(ptrs.read))) return false;
 
     png_init_io(ptrs.read, iFile.fp);
     readPngData(ptrs, mImageData, mImageWidth, mImageHeight);
@@ -256,7 +256,7 @@ bool PngImage::loadImageFromMemory(const unsigned char* data, unsigned dataSize)
     ptrs.info = png_create_info_struct(ptrs.read);
     if(!ptrs.info) return false;
 
-    if(setjmp(ptrs.read->jmpbuf)) return false;
+    if(setjmp(png_jmpbuf(ptrs.read))) return false;
     readPngData(ptrs, mImageData, mImageWidth, mImageHeight);
     return true;
 }
@@ -294,7 +294,7 @@ bool PngImage::saveImage(const char* filename, bool printErrorMsg) const
         return false;
     }
 
-    if(setjmp(ptrs.write->jmpbuf)) return false;
+    if(setjmp(png_jmpbuf(ptrs.write))) return false;
 
     png_init_io(ptrs.write, oFile.fp);
 

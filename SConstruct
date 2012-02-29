@@ -2,6 +2,7 @@
 
 import os
 import os.path
+import string
 import sys
 from subprocess import call
 
@@ -49,58 +50,78 @@ def CheckProtobuf(context, version):
     context.Result(ret)
     return ret
 
+# Adding various options to the SConstruct
 AddOption('--cxx', dest='cxx', type='string', nargs=1, action='store', metavar='STRING', help='C++ Compiler')
 AddOption('--stxxlroot', dest='stxxlroot', type='string', nargs=1, action='store', metavar='STRING', help='root directory of STXXL')
 AddOption('--verbosity', dest='verbosity', type='string', nargs=1, action='store', metavar='STRING', help='make Scons talking')
 AddOption('--buildconfiguration', dest='buildconfiguration', type='string', nargs=1, action='store', metavar='STRING', help='debug or release')
-env = Environment(ENV = {'PATH' : os.environ['PATH']} ,COMPILER = GetOption('cxx'))
-if sys.platform.startswith("freebsd"):
-	env.ParseConfig('pkg-config --cflags --libs protobuf')
+AddOption('--no-march', dest='nomarch', type='string', nargs=0, action='store', metavar='STRING', help='turn off -march optimization in release mode')
+
+env = Environment( ENV = {'PATH' : os.environ['PATH']} ,COMPILER = GetOption('cxx'))
+conf = Configure(env, custom_tests = { 'CheckBoost' : CheckBoost, 'CheckProtobuf' : CheckProtobuf })
+
 if GetOption('cxx') is None:
     #default Compiler
-    print 'Using default C++ Compiler: ', env['CXX']
+    print 'Using default C++ Compiler: ', env['CXX'].strip() 
 else:
     env.Replace(CXX = GetOption('cxx'))
     print 'Using user supplied C++ Compiler: ', env['CXX']
-if GetOption('stxxlroot') is not None:
-   env.Append(CPPPATH = GetOption('stxxlroot')+'/include')
-   env.Append(LIBPATH = GetOption('stxxlroot')+'/lib')
-   print 'STXXLROOT = ', GetOption('stxxlroot')
-if sys.platform == 'win32':
-    #SCons really wants to use Microsoft compiler
-    print "Compiling is not yet supported on Windows"
-    Exit(-1)
-else:  #Mac OS X
-    if sys.platform == 'darwin':
-        print "Compiling is experimental on Mac"
-        env.Append(CPPPATH = ['/opt/local/include/', '/opt/local/include/libxml2'])
-	env.Append(LIBPATH = ['/opt/local/lib'])
-    elif sys.platform.startswith('freebsd'):
-        env.Append(CPPPATH = ['/usr/local/include', '/usr/local/include/libxml2'])
-        env.Append(LIBPATH = ['/usr/local/lib'])
-    else:
-        env.Append(CPPPATH = ['/usr/include', '/usr/include/include', '/usr/include/libxml2/'])
+
 if GetOption('buildconfiguration') == 'debug':
 	env.Append(CCFLAGS = ['-Wall', '-g3', '-rdynamic'])
 else:
-	env.Append(CCFLAGS = ['-O3', '-DNDEBUG', '-march=native'])
-#print "Compiling with: ", env['CXX']
-conf = Configure(env, custom_tests = { 'CheckBoost' : CheckBoost, 'CheckProtobuf' : CheckProtobuf })
+	env.Append(CCFLAGS = ['-O3', '-DNDEBUG'])
+
+if sys.platform == 'darwin':	#Mac OS X
+	#os x default installations
+	env.Append(CPPPATH = ['/usr/include/libxml2'] )		
+	env.Append(CPPPATH = ['/usr/X11/include'])		#comes with os x
+	env.Append(LIBPATH = ['/usr/X11/lib'])			#needed for libpng
+	
+	#assume stxxl and boost are installed via homebrew. call brew binary to get folder locations
+	import subprocess
+	stxxl_prefix = subprocess.check_output(["brew", "--prefix", "libstxxl"]).strip()
+	env.Append(CPPPATH = [stxxl_prefix+"/include"] )
+	env.Append(LIBPATH = [stxxl_prefix+"/lib"] )
+	boost_prefix = subprocess.check_output(["brew", "--prefix", "boost"]).strip()
+	env.Append(CPPPATH = [boost_prefix+"/include"] )
+	env.Append(LIBPATH = [boost_prefix+"/lib"] )	
+elif sys.platform.startswith("freebsd"):
+	env.ParseConfig('pkg-config --cflags --libs protobuf')
+	env.Append(CPPPATH = ['/usr/local/include', '/usr/local/include/libxml2'])
+	env.Append(LIBPATH = ['/usr/local/lib'])
+	if GetOption('stxxlroot') is not None:
+	   env.Append(CPPPATH = GetOption('stxxlroot')+'/include')
+	   env.Append(LIBPATH = GetOption('stxxlroot')+'/lib')
+	   print 'STXXLROOT = ', GetOption('stxxlroot')
+elif sys.platform == 'win32':
+	#SCons really wants to use Microsoft compiler
+	print "Compiling is not yet supported on Windows"
+	Exit(-1)
+else:
+	print "Default platform"
+	env.Append(CPPPATH = ['/usr/include', '/usr/include/include', '/usr/include/libxml2/'])
+	if not conf.CheckLibWithHeader('pthread', 'pthread.h', 'CXX'):
+		print "pthread not found. Exiting"
+		Exit(-1)
+
+#Check if architecture optimizations shall be turned off
+if GetOption('buildconfiguration') != 'debug' and GetOption('nomarch') == None and sys.platform != 'darwin':
+	env.Append(CCFLAGS = ['-march=native'])
+
 if not conf.CheckHeader('omp.h'):
 	print "Compiler does not support OpenMP. Exiting"
-	if sys.platform == 'darwin':
-		print "Continuing because we are on Mac. This might be fatal."
-	else:
-		Exit(-1)
+	Exit(-1)
+
 if not conf.CheckLibWithHeader('bz2', 'bzlib.h', 'CXX'):
 	print "bz2 library not found. Exiting"
 	Exit(-1)
 if not conf.CheckLibWithHeader('png', 'png.h', 'CXX'):
-	print "png library or header not found. Exiting"
+	print "png library not found. Exiting"
 	Exit(-1)
-if not conf.CheckLibWithHeader('pthread', 'pthread.h', 'CXX'):
-        print "pthread not found. Exiting"
-        Exit(-1)
+if not conf.CheckLibWithHeader('zip', 'zip.h', 'CXX'):
+	print "Zip library not found. Exiting"
+	Exit(-1)
 if not conf.CheckLibWithHeader('protobuf', 'google/protobuf/descriptor.h', 'CXX'):
 	print "Google Protobuffer library not found. Exiting"
 	Exit(-1)
@@ -120,16 +141,10 @@ if not conf.CheckLibWithHeader('xml2', 'libxml/xmlreader.h', 'CXX'):
 if not conf.CheckLibWithHeader('z', 'zlib.h', 'CXX'):
 	print "zlib library or header not found. Exiting"
 	Exit(-1)
-if not conf.CheckLibWithHeader('zip', 'zip.h', 'CXX'):
-	print "Zip library not found. Exiting"
-	Exit(-1)
 #Check BOOST installation
 if not (conf.CheckBoost('1.41')):
 	print 'Boost version >= 1.41 needed'
 	Exit(-1);
-if not conf.CheckLib('boost_system', language="C++"):
-	print "boost_system library not found. Exiting"
-	Exit(-1)
 if not conf.CheckLibWithHeader('boost_thread', 'boost/thread.hpp', 'CXX'):
 	if not conf.CheckLibWithHeader('boost_thread-mt', 'boost/thread.hpp', 'CXX'):
 		print "boost thread library not found. Exiting"
@@ -139,14 +154,21 @@ if not conf.CheckLibWithHeader('boost_thread', 'boost/thread.hpp', 'CXX'):
 		env.Append(CCFLAGS = ' -lboost_thread-mt')
 		env.Append(LINKFLAGS = ' -lboost_thread-mt')
 if not conf.CheckLibWithHeader('boost_regex', 'boost/regex.hpp', 'CXX'):
-	print "boost/regex.hpp not found. Exiting"
-	Exit(-1)
-if not conf.CheckCXXHeader('boost/array.hpp'):
-	print "boost/thread.hpp not found. Exiting"
-	Exit(-1)
-if not conf.CheckCXXHeader('boost/asio.hpp'):
-	print "boost/thread.hpp not found. Exiting"
-	Exit(-1)
+	if not conf.CheckLibWithHeader('boost_regex-mt', 'boost/regex.hpp', 'CXX'):
+		print "boost/regex.hpp not found. Exiting"
+		Exit(-1)
+	else:
+		print "using boost_regex -mt"
+		env.Append(CCFLAGS = ' -lboost_regex-mt')
+		env.Append(LINKFLAGS = ' -lboost_regex-mt')
+if not conf.CheckLib('boost_system', language="C++"):
+	if not conf.CheckLib('boost_system-mt', language="C++"):
+		print "boost_system library not found. Exiting"
+		Exit(-1)
+	else:
+		print "using boost -mt"
+		env.Append(CCFLAGS = ' -lboost_system-mt')
+		env.Append(LINKFLAGS = ' -lboost_system-mt')
 if not conf.CheckCXXHeader('boost/bind.hpp'):
 	print "boost/bind.hpp not found. Exiting"
 	Exit(-1)
@@ -190,17 +212,26 @@ if not conf.CheckCXXHeader('boost/unordered_map.hpp'):
 	print "boost thread header not found. Exiting"
 	Exit(-1)
 
+#checks for intels thread building blocks library
+#if not conf.CheckLibWithHeader('tbb', 'tbb/tbb.h', 'CXX'):
+#	print "Intel TBB library not found. Exiting"
+#	Exit(-1)
+#if not conf.CheckCXXHeader('tbb/task_scheduler_init.h'):
+#	print "tbb/task_scheduler_init.h not found. Exiting"
+#	Exit(-1)
+
+
 protobld = Builder(action = 'protoc -I=DataStructures/pbf-proto --cpp_out=DataStructures/pbf-proto $SOURCE')
 env.Append(BUILDERS = {'Protobuf' : protobld})
-env.Protobuf('DataStructures/pbf-proto/fileformat.proto')
-env.Protobuf('DataStructures/pbf-proto/osmformat.proto')
-env.Append(CCFLAGS = ['-fopenmp'])
-env.Append(LINKFLAGS = ['-fopenmp'])
+osm1 = env.Protobuf('DataStructures/pbf-proto/fileformat.proto')
+osm2 = env.Protobuf('DataStructures/pbf-proto/osmformat.proto')
 
-env.Program(target = 'osrm-extract', source = ["extractor.cpp", Glob('DataStructures/pbf-proto/*.pb.cc'), Glob('Util/*.cpp')])
-env.Program(target = 'osrm-prepare', source = ["createHierarchy.cpp", 'Contractor/EdgeBasedGraphFactory.cpp', Glob('Util/SRTMLookup/*.cpp')])
-env.Append(CCFLAGS = ['-lboost_regex', '-lboost_iostreams', '-lbz2', '-lz', '-lprotobuf'])
-env.Append(LINKFLAGS = ['-lboost_system'])
-env.Program(target = 'osrm-routed', source = ["routed.cpp", 'Descriptors/DescriptionFactory.cpp', Glob('ThirdParty/*.cc')], CCFLAGS = ['-DROUTED'])
+#Hack to make OSRM compile on the default OS X Compiler.
+if sys.platform != 'darwin':
+	env.Append(CCFLAGS = ['-fopenmp'])
+	env.Append(LINKFLAGS = ['-fopenmp'])
+
+env.Program(target = 'osrm-extract', source = ["extractor.cpp", Glob('DataStructures/pbf-proto/*.pb.cc'), Glob('Util/*.cpp')], depends=['osm1', 'osm2'])
+env.Program(target = 'osrm-prepare', source = ["createHierarchy.cpp", 'Contractor/EdgeBasedGraphFactory.cpp', Glob('Util/SRTMLookup/*.cpp'), Glob('Algorithms/*.cpp')])
+env.Program(target = 'osrm-routed', source = ["routed.cpp", 'Descriptors/DescriptionFactory.cpp', Glob('ThirdParty/*.cc')], CCFLAGS = env['CCFLAGS'] + ['-DROUTED'])
 env = conf.Finish()
-

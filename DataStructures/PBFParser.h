@@ -223,8 +223,11 @@ private:
                 keyVals.Add(key, value);
                 denseTagIndex += 2;
             }
-            if("bollard" == keyVals.Find("barrier"))
+            if("" != keyVals.Find("barrier"))
                 n.bollard = true;
+
+            if("traffic_signals" == keyVals.Find("highway"))
+                n.trafficLight = true;
 
             if(!(*addressCallback)(n, keyVals))
                 std::cerr << "[PBFParser] adress not parsed" << std::endl;
