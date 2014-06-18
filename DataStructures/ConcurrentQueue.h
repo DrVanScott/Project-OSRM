@@ -1,98 +1,88 @@
 /*
-    open source routing machine
-    Copyright (C) Dennis Luxen, others 2010
 
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU AFFERO General Public License as published by
-the Free Software Foundation; either version 3 of the License, or
-any later version.
+Copyright (c) 2013, Project OSRM, Dennis Luxen, others
+All rights reserved.
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
-You should have received a copy of the GNU Affero General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-or see http://www.gnu.org/licenses/agpl.txt.
- */
+Redistributions of source code must retain the above copyright notice, this list
+of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this
+list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
 
-#ifndef CONCURRENTQUEUE_H_INCLUDED
-#define CONCURRENTQUEUE_H_INCLUDED
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include <queue>
-#include <boost/signals2/mutex.hpp>
+*/
+
+#ifndef CONCURRENT_QUEUE_H
+#define CONCURRENT_QUEUE_H
 
 #include "../typedefs.h"
 
-/* 
-   Concurrent Queue written by Anthony Williams: 
-   http://www.justsoftwaresolutions.co.uk/threading/implementing-a-thread-safe-queue-using-condition-variables.html  
-*/
-template<typename Data>
-class ConcurrentQueue {
+#include <boost/circular_buffer.hpp>
+#include <condition_variable>
+#include <mutex>
 
-public:
-    ConcurrentQueue(const size_t max_size) 
-        : max_queue_size(max_size) {
+template <typename Data> class ConcurrentQueue
+{
+  public:
+    explicit ConcurrentQueue(const size_t max_size) : m_internal_queue(max_size) {}
+
+    inline void push(const Data &data)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_not_full.wait(lock,
+                        [this]
+                        { return m_internal_queue.size() < m_internal_queue.capacity(); });
+        m_internal_queue.push_back(data);
+        m_mutex.unlock();
+        m_not_empty.notify_one();
     }
 
-    void push(Data const& data) {
-        if (size_exceeded()) {
-            boost::mutex::scoped_lock qf_lock(queue_full_mutex);
-            queue_full_cv.wait(qf_lock);
-        }
+    inline bool empty() const { return m_internal_queue.empty(); }
 
-        boost::mutex::scoped_lock lock(queue_mutex);
-        internal_queue.push(data);
-        lock.unlock();
-        queue_cv.notify_one();
+    inline void wait_and_pop(Data &popped_value)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_not_empty.wait(lock,
+                         [this]
+                         { return !m_internal_queue.empty(); });
+        popped_value = m_internal_queue.front();
+        m_internal_queue.pop_front();
+        m_mutex.unlock();
+        m_not_full.notify_one();
     }
 
-    bool empty() const {
-        return internal_queue.empty();
-    }
-
-    bool try_pop(Data& popped_value) {
-        boost::mutex::scoped_lock lock(queue_mutex);
-        if(internal_queue.empty()) {
+    inline bool try_pop(Data &popped_value)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_internal_queue.empty())
+        {
             return false;
         }
-        
-        popped_value=internal_queue.front();
-        internal_queue.pop();
-        queue_full_cv.notify_one();
+        popped_value = m_internal_queue.front();
+        m_internal_queue.pop_front();
+        m_mutex.unlock();
+        m_not_full.notify_one();
         return true;
     }
 
-    void wait_and_pop(Data& popped_value) {
-        boost::mutex::scoped_lock lock(queue_mutex);
-        while(internal_queue.empty()) {
-            queue_cv.wait(lock);
-        }
-        
-        popped_value=internal_queue.front();
-        internal_queue.pop();
-        queue_full_cv.notify_one();
-    }
-
-    int size() const {
-        return static_cast<int>(internal_queue.size());
-    }
-
-private:
-    std::queue<Data> internal_queue;
-    mutable boost::mutex queue_mutex;
-    mutable boost::mutex queue_full_mutex;
-    boost::condition_variable queue_cv;
-    boost::condition_variable queue_full_cv;
-    const size_t max_queue_size;
-
-    bool size_exceeded() const {
-        return internal_queue.size() >= max_queue_size;
-    }
-
+  private:
+    boost::circular_buffer<Data> m_internal_queue;
+    std::mutex m_mutex;
+    std::condition_variable m_not_empty;
+    std::condition_variable m_not_full;
 };
 
-#endif //#ifndef CONCURRENTQUEUE_H_INCLUDED
+#endif // CONCURRENT_QUEUE_H

@@ -1,178 +1,105 @@
 /*
-    open source routing machine
-    Copyright (C) Dennis Luxen, others 2010
 
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU AFFERO General Public License as published by
-the Free Software Foundation; either version 3 of the License, or
-any later version.
+Copyright (c) 2013, Project OSRM, Dennis Luxen, others
+All rights reserved.
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
-You should have received a copy of the GNU Affero General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-or see http://www.gnu.org/licenses/agpl.txt.
- */
+Redistributions of source code must retain the above copyright notice, this list
+of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this
+list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+*/
 
 #ifndef CONNECTION_H
 #define CONNECTION_H
 
-#include <vector>
+#include "Http/CompressionType.h"
+#include "Http/Request.h"
 
-#include <boost/asio.hpp>
+#include <osrm/Reply.h>
+
 #include <boost/array.hpp>
-#include <boost/bind.hpp>
-#include <boost/noncopyable.hpp>
-#include <boost/shared_ptr.hpp>
-#include <boost/enable_shared_from_this.hpp>
+#include <boost/asio.hpp>
+#include <boost/config.hpp>
+#include <boost/version.hpp>
 
-#include "../DataStructures/Util.h"
-#include "BasicDatastructures.h"
-#include "RequestHandler.h"
-#include "RequestParser.h"
+ #include <memory>
+ #include <string>
+ #include <vector>
 
-#include "zlib.h"
+//workaround for incomplete std::shared_ptr compatibility in old boost versions
+#if BOOST_VERSION < 105300 || defined BOOST_NO_CXX11_SMART_PTR
 
-namespace http {
+namespace boost {
+template<class T>
+const T* get_pointer(std::shared_ptr<T> const& p)
+{
+    return p.get();
+}
+
+template<class T>
+T* get_pointer(std::shared_ptr<T>& p)
+{
+    return p.get();
+}
+} // namespace boost
+
+#endif
+
+
+
+class RequestHandler;
+
+namespace http
+{
+
+class RequestParser;
 
 /// Represents a single connection from a client.
-class Connection : public boost::enable_shared_from_this<Connection>, private boost::noncopyable {
-public:
-	explicit Connection(boost::asio::io_service& io_service, RequestHandler& handler) : strand(io_service), TCPsocket(io_service), requestHandler(handler) {}
+class Connection : public std::enable_shared_from_this<Connection>
+{
+  public:
+    explicit Connection(boost::asio::io_service &io_service, RequestHandler &handler);
+    Connection(const Connection &) = delete;
+    ~Connection();
 
-	boost::asio::ip::tcp::socket& socket() {
-		return TCPsocket;
-	}
+    boost::asio::ip::tcp::socket &socket();
 
-	/// Start the first asynchronous operation for the connection.
-	void start() {
-	    TCPsocket.async_read_some(boost::asio::buffer(incomingDataBuffer), strand.wrap( boost::bind(&Connection::handleRead, this->shared_from_this(), boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred)));
-	}
+    /// Start the first asynchronous operation for the connection.
+    void start();
 
-private:
-	void handleRead(const boost::system::error_code& e, std::size_t bytes_transferred) {
-		if (!e) {
-			CompressionType compressionType(noCompression);
-			boost::tribool result;
-			boost::tie(result, boost::tuples::ignore) = requestParser.Parse( request, incomingDataBuffer.data(), incomingDataBuffer.data() + bytes_transferred, &compressionType);
+  private:
+    void handle_read(const boost::system::error_code &e, std::size_t bytes_transferred);
 
-			if (result) {
-				//                std::cout << "----" << std::endl;
-				//				if(compressionType == gzipRFC1952)
-				//					std::cout << "[debug] using gzip" << std::endl;
-				//				if(compressionType == deflateRFC1951)
-				//					std::cout << "[debug] using deflate" << std::endl;
-				//				if(compressionType == noCompression)
-				//					std::cout << "[debug] no compression" << std::endl;
-			    request.endpoint = TCPsocket.remote_endpoint().address();
-				requestHandler.handle_request(request, reply);
+    /// Handle completion of a write operation.
+    void handle_write(const boost::system::error_code &e);
 
-				Header compressionHeader;
-				std::vector<unsigned char> compressed;
-				std::vector<boost::asio::const_buffer> outputBuffer;
-				switch(compressionType) {
-				case deflateRFC1951:
-					compressionHeader.name = "Content-Encoding";
-					compressionHeader.value = "deflate";
-					reply.headers.insert(reply.headers.begin(), compressionHeader);   //push_back(compressionHeader);
-					compressCharArray(reply.content.c_str(), strlen(reply.content.c_str()), compressed, compressionType);
-					reply.setSize(compressed.size());
-					outputBuffer = reply.HeaderstoBuffers();
-					outputBuffer.push_back(boost::asio::buffer(compressed));
-					boost::asio::async_write(TCPsocket, outputBuffer, strand.wrap( boost::bind(&Connection::handleWrite, this->shared_from_this(), boost::asio::placeholders::error)));
-					break;
-				case gzipRFC1952:
-					compressionHeader.name = "Content-Encoding";
-					compressionHeader.value = "gzip";
-					reply.headers.insert(reply.headers.begin(), compressionHeader);
-					compressCharArray(reply.content.c_str(), strlen(reply.content.c_str()), compressed, compressionType);
-					reply.setSize(compressed.size());
-					outputBuffer = reply.HeaderstoBuffers();
-					outputBuffer.push_back(boost::asio::buffer(compressed));
-					boost::asio::async_write(TCPsocket, outputBuffer, strand.wrap( boost::bind(&Connection::handleWrite, this->shared_from_this(), boost::asio::placeholders::error)));break;
-				case noCompression:
-					boost::asio::async_write(TCPsocket, reply.toBuffers(), strand.wrap( boost::bind(&Connection::handleWrite, this->shared_from_this(), boost::asio::placeholders::error)));
-					break;
-				}
+    void compressBufferCollection(std::vector<char> uncompressed_data,
+                                  CompressionType compression_type,
+                                  std::vector<char> &compressed_data);
 
-			} else if (!result) {
-				reply = Reply::stockReply(Reply::badRequest);
-				boost::asio::async_write(TCPsocket, reply.toBuffers(), strand.wrap( boost::bind(&Connection::handleWrite, this->shared_from_this(), boost::asio::placeholders::error)));
-			} else {
-				TCPsocket.async_read_some(boost::asio::buffer(incomingDataBuffer), strand.wrap( boost::bind(&Connection::handleRead, this->shared_from_this(), boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred)));
-			}
-		}
-	}
-
-	/// Handle completion of a write operation.
-	void handleWrite(const boost::system::error_code& e) {
-		if (!e) {
-			// Initiate graceful connection closure.
-			boost::system::error_code ignoredEC;
-			TCPsocket.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignoredEC);
-		}
-		// No new asynchronous operations are started. This means that all shared_ptr
-		// references to the connection object will disappear and the object will be
-		// destroyed automatically after this handler returns. The connection class's
-		// destructor closes the socket.
-	}
-
-	void compressCharArray(const void *in_data, size_t in_data_size, std::vector<unsigned char> &buffer, CompressionType type) {
-		const size_t BUFSIZE = 128 * 1024;
-		unsigned char temp_buffer[BUFSIZE];
-
-		z_stream strm;
-		strm.zalloc = 0;
-		strm.zfree = 0;
-		strm.next_in = (unsigned char *)(in_data);
-		strm.avail_in = in_data_size;
-		strm.next_out = temp_buffer;
-		strm.avail_out = BUFSIZE;
-		strm.data_type = Z_ASCII;
-
-		switch(type){
-		case deflateRFC1951:
-			deflateInit(&strm, Z_BEST_SPEED);
-			break;
-		case gzipRFC1952:
-			/*
-			 * Big thanks to deusty who explains how to have gzip compression turned on by the right call to deflateInit2():
-			 * http://deusty.blogspot.com/2007/07/gzip-compressiondecompression.html
-			 */
-			deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, (15+16), 8, Z_DEFAULT_STRATEGY);
-			break;
-		case noCompression:
-			std::cerr << "[error] contradicting compression request" << std::endl;
-			return;
-		}
-
-		int deflate_res = Z_OK;
-		do {
-			if (strm.avail_out == 0) {
-				buffer.insert(buffer.end(), temp_buffer, temp_buffer + BUFSIZE);
-				strm.next_out = temp_buffer;
-				strm.avail_out = BUFSIZE;
-			}
-			deflate_res = deflate(&strm, Z_FINISH);
-
-		} while (strm.avail_out == 0);
-
-		assert(deflate_res == Z_STREAM_END);
-		buffer.insert(buffer.end(), temp_buffer, temp_buffer + BUFSIZE - strm.avail_out);
-		deflateEnd(&strm);
-	}
-
-	boost::asio::io_service::strand strand;
-	boost::asio::ip::tcp::socket TCPsocket;
-	RequestHandler& requestHandler;
-	boost::array<char, 8192> incomingDataBuffer;
-	Request request;
-	RequestParser requestParser;
-	Reply reply;
+    boost::asio::io_service::strand strand;
+    boost::asio::ip::tcp::socket TCP_socket;
+    RequestHandler &request_handler;
+    boost::array<char, 8192> incoming_data_buffer;
+    Request request;
+    RequestParser *request_parser;
+    Reply reply;
 };
 
 } // namespace http

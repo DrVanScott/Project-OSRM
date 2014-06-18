@@ -1,516 +1,276 @@
 /*
-    open source routing machine
-    Copyright (C) Dennis Luxen, others 2010
 
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU AFFERO General Public License as published by
-the Free Software Foundation; either version 3 of the License, or
-any later version.
+Copyright (c) 2013, Project OSRM, Dennis Luxen, others
+All rights reserved.
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
-You should have received a copy of the GNU Affero General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-or see http://www.gnu.org/licenses/agpl.txt.
- */
+Redistributions of source code must retain the above copyright notice, this list
+of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this
+list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
 
-#ifdef STXXL_VERBOSE_LEVEL
-#undef STXXL_VERBOSE_LEVEL
-#endif
-#define STXXL_VERBOSE_LEVEL -1000
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include <algorithm>
-#include <cassert>
-#include <climits>
-#include <cstdio>
+*/
+
+#include "Extractor/ExtractorCallbacks.h"
+#include "Extractor/ExtractionContainers.h"
+#include "Extractor/ScriptingEnvironment.h"
+#include "Extractor/PBFParser.h"
+#include "Extractor/XMLParser.h"
+#include "Util/GitDescription.h"
+#include "Util/MachineInfo.h"
+#include "Util/OpenMPWrapper.h"
+#include "Util/OSRMException.h"
+#include "Util/ProgramOptions.h"
+#include "Util/SimpleLogger.h"
+#include "Util/StringUtil.h"
+#include "Util/UUID.h"
+#include "typedefs.h"
+
 #include <cstdlib>
-#include <exception>
+
+#include <chrono>
 #include <iostream>
 #include <fstream>
-#include <sstream>
 #include <string>
-#include <vector>
+#include <unordered_map>
 
-#include <libxml/xmlreader.h>
-#include <boost/foreach.hpp>
-#include <boost/property_tree/ptree.hpp>
-#include <boost/property_tree/ini_parser.hpp>
-#include <unistd.h>
-#include <stxxl.h>
+ExtractorCallbacks *extractor_callbacks;
+UUID uuid;
 
-#include "typedefs.h"
-#include "DataStructures/InputReaderFactory.h"
-#include "DataStructures/ExtractorCallBacks.h"
-#include "DataStructures/ExtractorStructs.h"
-#include "DataStructures/PBFParser.h"
-#include "DataStructures/XMLParser.h"
-#include "Util/BaseConfiguration.h"
-#include "Util/InputFileUtil.h"
-#include "Util/MachineInfo.h"
+int main(int argc, char *argv[])
+{
+    try
+    {
+        LogPolicy::GetInstance().Unmute();
+        std::chrono::time_point<std::chrono::steady_clock> startup_time =
+            std::chrono::steady_clock::now();
 
-using namespace std;
+        boost::filesystem::path config_file_path, input_path, profile_path;
+        int requested_num_threads;
 
-typedef BaseConfiguration ExtractorConfiguration;
+        // declare a group of options that will be allowed only on command line
+        boost::program_options::options_description generic_options("Options");
+        generic_options.add_options()("version,v", "Show version")("help,h",
+                                                                   "Show this help message")(
+            "config,c",
+            boost::program_options::value<boost::filesystem::path>(&config_file_path)
+                ->default_value("extractor.ini"),
+            "Path to a configuration file.");
 
-unsigned globalRestrictionCounter = 0;
-ExtractorCallbacks * extractCallBacks;
+        // declare a group of options that will be allowed both on command line and in config file
+        boost::program_options::options_description config_options("Configuration");
+        config_options.add_options()("profile,p",
+                                     boost::program_options::value<boost::filesystem::path>(
+                                         &profile_path)->default_value("profile.lua"),
+                                     "Path to LUA routing profile")(
+            "threads,t",
+            boost::program_options::value<int>(&requested_num_threads)->default_value(8),
+            "Number of threads to use");
 
-bool nodeFunction(_Node n);
-bool adressFunction(_Node n, HashTable<string, string> & keyVals);
-bool restrictionFunction(_RawRestrictionContainer r);
-bool wayFunction(_Way w);
+        // hidden options, will be allowed both on command line and in config file, but will not be
+        // shown to the user
+        boost::program_options::options_description hidden_options("Hidden options");
+        hidden_options.add_options()(
+            "input,i",
+            boost::program_options::value<boost::filesystem::path>(&input_path),
+            "Input file in .osm, .osm.bz2 or .osm.pbf format");
 
-template<class ClassT>
-bool removeIfUnused(ClassT n) { return (false == n.used); }
+        // positional option
+        boost::program_options::positional_options_description positional_options;
+        positional_options.add("input", 1);
 
+        // combine above options for parsing
+        boost::program_options::options_description cmdline_options;
+        cmdline_options.add(generic_options).add(config_options).add(hidden_options);
 
-int main (int argc, char *argv[]) {
+        boost::program_options::options_description config_file_options;
+        config_file_options.add(config_options).add(hidden_options);
 
-    if(argc < 2) {
-        ERR("usage: \n" << argv[0] << " <file.osm/.osm.bz2/.osm.pbf>");
+        boost::program_options::options_description visible_options(
+            boost::filesystem::basename(argv[0]) + " <input.osm/.osm.bz2/.osm.pbf> [options]");
+        visible_options.add(generic_options).add(config_options);
+
+        // parse command line options
+        boost::program_options::variables_map option_variables;
+        boost::program_options::store(boost::program_options::command_line_parser(argc, argv)
+                                          .options(cmdline_options)
+                                          .positional(positional_options)
+                                          .run(),
+                                      option_variables);
+
+        if (option_variables.count("version"))
+        {
+            SimpleLogger().Write() << g_GIT_DESCRIPTION;
+            return 0;
+        }
+
+        if (option_variables.count("help"))
+        {
+            SimpleLogger().Write() << visible_options;
+            return 0;
+        }
+
+        boost::program_options::notify(option_variables);
+
+        // parse config file
+        if (boost::filesystem::is_regular_file(config_file_path))
+        {
+            SimpleLogger().Write() << "Reading options from: " << config_file_path.string();
+            std::string ini_file_contents = ReadIniFileAndLowerContents(config_file_path);
+            std::stringstream config_stream(ini_file_contents);
+            boost::program_options::store(parse_config_file(config_stream, config_file_options),
+                                          option_variables);
+            boost::program_options::notify(option_variables);
+        }
+
+        if (!option_variables.count("input"))
+        {
+            SimpleLogger().Write() << visible_options;
+            return 0;
+        }
+
+        if (1 > requested_num_threads)
+        {
+            SimpleLogger().Write(logWARNING) << "Number of threads must be 1 or larger";
+            return 1;
+        }
+
+        if (!boost::filesystem::is_regular_file(input_path))
+        {
+            SimpleLogger().Write(logWARNING) << "Input file " << input_path.string()
+                                             << " not found!";
+            return 1;
+        }
+
+        if (!boost::filesystem::is_regular_file(profile_path))
+        {
+            SimpleLogger().Write(logWARNING) << "Profile " << profile_path.string()
+                                             << " not found!";
+            return 1;
+        }
+
+        int real_num_threads = std::min(omp_get_num_procs(), requested_num_threads);
+
+        SimpleLogger().Write() << "Input file: " << input_path.filename().string();
+        SimpleLogger().Write() << "Profile: " << profile_path.filename().string();
+        SimpleLogger().Write() << "Threads: " << real_num_threads << " (requested "
+                               << requested_num_threads << ")";
+
+        /*** Setup Scripting Environment ***/
+        ScriptingEnvironment scripting_environment(profile_path.c_str());
+
+        omp_set_num_threads(real_num_threads);
+
+        bool file_has_pbf_format(false);
+        std::string output_file_name = input_path.string();
+        std::string restriction_fileName = input_path.string();
+        std::string::size_type pos = output_file_name.find(".osm.bz2");
+        if (pos == std::string::npos)
+        {
+            pos = output_file_name.find(".osm.pbf");
+            if (pos != std::string::npos)
+            {
+                file_has_pbf_format = true;
+            }
+        }
+        if (pos == std::string::npos)
+        {
+            pos = output_file_name.find(".pbf");
+            if (pos != std::string::npos)
+            {
+                file_has_pbf_format = true;
+            }
+        }
+        if (pos == std::string::npos)
+        {
+            pos = output_file_name.find(".osm");
+            if (pos == std::string::npos)
+            {
+                output_file_name.append(".osrm");
+                restriction_fileName.append(".osrm.restrictions");
+            }
+            else
+            {
+                output_file_name.replace(pos, 5, ".osrm");
+                restriction_fileName.replace(pos, 5, ".osrm.restrictions");
+            }
+        }
+        else
+        {
+            output_file_name.replace(pos, 8, ".osrm");
+            restriction_fileName.replace(pos, 8, ".osrm.restrictions");
+        }
+
+        std::unordered_map<std::string, NodeID> string_map;
+        ExtractionContainers extraction_containers;
+
+        string_map[""] = 0;
+        extractor_callbacks = new ExtractorCallbacks(extraction_containers, string_map);
+        BaseParser *parser;
+        if (file_has_pbf_format)
+        {
+            parser = new PBFParser(input_path.c_str(), extractor_callbacks, scripting_environment);
+        }
+        else
+        {
+            parser = new XMLParser(input_path.c_str(), extractor_callbacks, scripting_environment);
+        }
+
+        if (!parser->ReadHeader())
+        {
+            throw OSRMException("Parser not initialized!");
+        }
+        SimpleLogger().Write() << "Parsing in progress..";
+        std::chrono::time_point<std::chrono::steady_clock> parsing_start_time =
+            std::chrono::steady_clock::now();
+
+        parser->Parse();
+        delete parser;
+        delete extractor_callbacks;
+
+        std::chrono::duration<double> parsing_duration =
+            std::chrono::steady_clock::now() - parsing_start_time;
+        SimpleLogger().Write() << "Parsing finished after " << parsing_duration.count()
+                               << " seconds";
+
+        if (extraction_containers.all_edges_list.empty())
+        {
+            SimpleLogger().Write(logWARNING) << "The input data is empty, exiting.";
+            return 1;
+        }
+
+        extraction_containers.PrepareData(output_file_name, restriction_fileName);
+
+        std::chrono::duration<double> extraction_duration =
+            std::chrono::steady_clock::now() - startup_time;
+        SimpleLogger().Write() << "extraction finished after " << extraction_duration.count()
+                               << "s";
+        SimpleLogger().Write() << "To prepare the data for routing, run: "
+                               << "./osrm-prepare " << output_file_name << std::endl;
     }
-
-    //Check if another instance of stxxl is already running or if there is a general problem
-    try {
-        stxxl::vector<unsigned> testForRunningInstance;
-    } catch(std::exception & e) {
-        ERR("Could not instantiate STXXL layer." << std::endl << e.what());
+    catch (boost::program_options::too_many_positional_options_error &e)
+    {
+        SimpleLogger().Write(logWARNING) << "Only one input file can be specified";
+        return 1;
     }
-    double startupTime = get_timestamp();
-
-    INFO("extracting data from input file " << argv[1]);
-    bool isPBF(false);
-    std::string outputFileName(argv[1]);
-    std::string restrictionsFileName(argv[1]);
-    std::string::size_type pos = outputFileName.find(".osm.bz2");
-    if(pos==std::string::npos) {
-        pos = outputFileName.find(".osm.pbf");
-        if(pos!=std::string::npos) {
-            isPBF = true;
-        }
+    catch (std::exception &e)
+    {
+        SimpleLogger().Write(logWARNING) << "Exception occured: " << e.what();
+        return 1;
     }
-    if(pos!=string::npos) {
-        outputFileName.replace(pos, 8, ".osrm");
-        restrictionsFileName.replace(pos, 8, ".osrm.restrictions");
-    } else {
-        pos=outputFileName.find(".osm");
-        if(pos!=string::npos) {
-            outputFileName.replace(pos, 5, ".osrm");
-            restrictionsFileName.replace(pos, 5, ".osrm.restrictions");
-        } else {
-            outputFileName.append(".osrm");
-            restrictionsFileName.append(".osrm.restrictions");
-        }
-    }
-    std::string adressFileName(outputFileName);
-    Settings settings;
-
-    boost::property_tree::ptree pt;
-    try {
-        INFO("Loading speed profiles");
-        boost::property_tree::ini_parser::read_ini("speedprofile.ini", pt);
-        INFO("Found the following speed profiles: ");
-        int profileCounter(0);
-        BOOST_FOREACH(boost::property_tree::ptree::value_type &v, pt.get_child("")) {
-            std::string name = v.first;
-            cout << " [" << profileCounter << "]" << name << endl;
-            ++profileCounter;
-        }
-        std::string usedSpeedProfile(pt.get_child("").begin()->first);
-        INFO("Using profile \"" << usedSpeedProfile << "\"")
-        BOOST_FOREACH(boost::property_tree::ptree::value_type &v, pt.get_child(usedSpeedProfile)) {
-            std::string name = v.first;
-            std::string value = v.second.get<std::string>("");
-            DEBUG("inserting " << name << "=" << value);
-            if(name == "obeyOneways") {
-                if(value == "no")
-                    settings.obeyOneways = false;
-            } else {
-                if(name == "obeyBollards") {
-                    if(value == "no") {
-                        settings.obeyBollards = false;
-                    }
-                } else {
-                    if(name == "useRestrictions") {
-                        if(value == "no")
-                            settings.useRestrictions = false;
-                    } else {
-                        if(name == "accessTag") {
-                            settings.accessTag = value;
-                        } else {
-                            if(name == "excludeFromGrid") {
-                                settings.excludeFromGrid = value;
-                            } else {
-                                if(name == "defaultSpeed") {
-                                    settings.defaultSpeed = atoi(value.c_str());
-                                    settings.speedProfile["default"] = std::make_pair(settings.defaultSpeed, settings.speedProfile.size() );
-                                } else {
-                                	if( name == "trafficLightPenalty") {
-                                		settings.trafficLightPenalty = atoi(value.c_str());
-                                	}
-                                }
-                            }
-                        }
-                    }
-                }
-                settings.speedProfile[name] = std::make_pair(std::atoi(value.c_str()), settings.speedProfile.size() );
-            }
-        }
-    } catch(std::exception& e) {
-        ERR("caught: " << e.what() );
-    }
-
-    unsigned amountOfRAM = 1;
-    unsigned installedRAM = GetPhysicalmemory(); 
-    if(installedRAM < 2048264) {
-        WARN("Machine has less than 2GB RAM.");
-    }
-    if(testDataFile("extractor.ini")) {
-        ExtractorConfiguration extractorConfig("extractor.ini");
-        unsigned memoryAmountFromFile = atoi(extractorConfig.GetParameter("Memory").c_str());
-        if( memoryAmountFromFile != 0 && memoryAmountFromFile <= installedRAM/(1024*1024))
-            amountOfRAM = memoryAmountFromFile;
-        INFO("Using " << amountOfRAM << " GB of RAM for buffers");
-    }
-
-    StringMap stringMap;
-    STXXLContainers externalMemory;
-
-    unsigned usedNodeCounter = 0;
-    unsigned usedEdgeCounter = 0;
-    double time = get_timestamp();
-
-    stringMap[""] = 0;
-    extractCallBacks = new ExtractorCallbacks(&externalMemory, settings, &stringMap);
-    BaseParser<_Node, _RawRestrictionContainer, _Way> * parser;
-    if(isPBF) {
-        parser = new PBFParser(argv[1]);
-    } else {
-        parser = new XMLParser(argv[1]);
-    }
-    parser->RegisterCallbacks(&nodeFunction, &restrictionFunction, &wayFunction, &adressFunction);
-    if(!parser->Init())
-        INFO("Parser not initialized!");
-    parser->Parse();
-
-    try {
-        //        INFO("raw no. of names:        " << externalMemory.nameVector.size());
-        //        INFO("raw no. of nodes:        " << externalMemory.allNodes.size());
-        //        INFO("no. of used nodes:       " << externalMemory.usedNodeIDs.size());
-        //        INFO("raw no. of edges:        " << externalMemory.allEdges.size());
-        //        INFO("raw no. of ways:         " << externalMemory.wayStartEndVector.size());
-        //        INFO("raw no. of addresses:    " << externalMemory.adressVector.size());
-        //        INFO("raw no. of restrictions: " << externalMemory.restrictionsVector.size());
-
-        cout << "[extractor] parsing finished after " << get_timestamp() - time << " seconds" << endl;
-        time = get_timestamp();
-        boost::uint64_t memory_to_use = static_cast<boost::uint64_t>(amountOfRAM) * 1024 * 1024 * 1024;
-
-        cout << "[extractor] Sorting used nodes        ... " << flush;
-        stxxl::sort(externalMemory.usedNodeIDs.begin(), externalMemory.usedNodeIDs.end(), Cmp(), memory_to_use);
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-
-        time = get_timestamp();
-        cout << "[extractor] Erasing duplicate nodes   ... " << flush;
-        stxxl::vector<NodeID>::iterator NewEnd = unique ( externalMemory.usedNodeIDs.begin(),externalMemory.usedNodeIDs.end() ) ;
-        externalMemory.usedNodeIDs.resize ( NewEnd - externalMemory.usedNodeIDs.begin() );
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-        time = get_timestamp();
-
-        cout << "[extractor] Sorting all nodes         ... " << flush;
-        stxxl::sort(externalMemory.allNodes.begin(), externalMemory.allNodes.end(), CmpNodeByID(), memory_to_use);
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-        time = get_timestamp();
-
-        cout << "[extractor] Sorting used ways         ... " << flush;
-        stxxl::sort(externalMemory.wayStartEndVector.begin(), externalMemory.wayStartEndVector.end(), CmpWayByID(), memory_to_use);
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-
-        cout << "[extractor] Sorting restrctns. by from... " << flush;
-        stxxl::sort(externalMemory.restrictionsVector.begin(), externalMemory.restrictionsVector.end(), CmpRestrictionContainerByFrom(), memory_to_use);
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-
-        cout << "[extractor] Fixing restriction starts ... " << flush;
-        STXXLRestrictionsVector::iterator restrictionsIT = externalMemory.restrictionsVector.begin();
-        STXXLWayIDStartEndVector::iterator wayStartAndEndEdgeIT = externalMemory.wayStartEndVector.begin();
-
-        while(wayStartAndEndEdgeIT != externalMemory.wayStartEndVector.end() && restrictionsIT != externalMemory.restrictionsVector.end()) {
-            if(wayStartAndEndEdgeIT->wayID < restrictionsIT->fromWay){
-                ++wayStartAndEndEdgeIT;
-                continue;
-            }
-            if(wayStartAndEndEdgeIT->wayID > restrictionsIT->fromWay) {
-                ++restrictionsIT;
-                continue;
-            }
-            assert(wayStartAndEndEdgeIT->wayID == restrictionsIT->fromWay);
-            NodeID viaNode = restrictionsIT->restriction.viaNode;
-
-            if(wayStartAndEndEdgeIT->firstStart == viaNode) {
-                restrictionsIT->restriction.fromNode = wayStartAndEndEdgeIT->firstTarget;
-            } else if(wayStartAndEndEdgeIT->firstTarget == viaNode) {
-                restrictionsIT->restriction.fromNode = wayStartAndEndEdgeIT->firstStart;
-            } else if(wayStartAndEndEdgeIT->lastStart == viaNode) {
-                restrictionsIT->restriction.fromNode = wayStartAndEndEdgeIT->lastTarget;
-            } else if(wayStartAndEndEdgeIT->lastTarget == viaNode) {
-                restrictionsIT->restriction.fromNode = wayStartAndEndEdgeIT->lastStart;
-            }
-            ++restrictionsIT;
-        }
-
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-        time = get_timestamp();
-
-        cout << "[extractor] Sorting restrctns. by to  ... " << flush;
-        stxxl::sort(externalMemory.restrictionsVector.begin(), externalMemory.restrictionsVector.end(), CmpRestrictionContainerByTo(), memory_to_use);
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-
-        time = get_timestamp();
-        unsigned usableRestrictionsCounter(0);
-        cout << "[extractor] Fixing restriction ends   ... " << flush;
-        restrictionsIT = externalMemory.restrictionsVector.begin();
-        wayStartAndEndEdgeIT = externalMemory.wayStartEndVector.begin();
-        while(wayStartAndEndEdgeIT != externalMemory.wayStartEndVector.end() && restrictionsIT != externalMemory.restrictionsVector.end()) {
-            if(wayStartAndEndEdgeIT->wayID < restrictionsIT->toWay){
-                ++wayStartAndEndEdgeIT;
-                continue;
-            }
-            if(wayStartAndEndEdgeIT->wayID > restrictionsIT->toWay) {
-                ++restrictionsIT;
-                continue;
-            }
-            NodeID viaNode = restrictionsIT->restriction.viaNode;
-            if(wayStartAndEndEdgeIT->lastStart == viaNode) {
-                restrictionsIT->restriction.toNode = wayStartAndEndEdgeIT->lastTarget;
-            } else if(wayStartAndEndEdgeIT->lastTarget == viaNode) {
-                restrictionsIT->restriction.toNode = wayStartAndEndEdgeIT->lastStart;
-            } else if(wayStartAndEndEdgeIT->firstStart == viaNode) {
-                restrictionsIT->restriction.toNode = wayStartAndEndEdgeIT->firstTarget;
-            } else if(wayStartAndEndEdgeIT->firstTarget == viaNode) {
-                restrictionsIT->restriction.toNode = wayStartAndEndEdgeIT->firstStart;
-            }
-
-            if(UINT_MAX != restrictionsIT->restriction.fromNode && UINT_MAX != restrictionsIT->restriction.toNode) {
-                ++usableRestrictionsCounter;
-            }
-            ++restrictionsIT;
-        }
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-        INFO("usable restrictions: " << usableRestrictionsCounter );
-        //serialize restrictions
-        ofstream restrictionsOutstream;
-        restrictionsOutstream.open(restrictionsFileName.c_str(), ios::binary);
-        restrictionsOutstream.write((char*)&usableRestrictionsCounter, sizeof(unsigned));
-        for(restrictionsIT = externalMemory.restrictionsVector.begin(); restrictionsIT != externalMemory.restrictionsVector.end(); ++restrictionsIT) {
-            if(UINT_MAX != restrictionsIT->restriction.fromNode && UINT_MAX != restrictionsIT->restriction.toNode) {
-                restrictionsOutstream.write((char *)&(restrictionsIT->restriction), sizeof(_Restriction));
-            }
-        }
-        restrictionsOutstream.close();
-
-        ofstream fout;
-        fout.open(outputFileName.c_str(), ios::binary);
-        fout.write((char*)&usedNodeCounter, sizeof(unsigned));
-        time = get_timestamp();
-        cout << "[extractor] Confirming/Writing used nodes     ... " << flush;
-
-        STXXLNodeVector::iterator nodesIT = externalMemory.allNodes.begin();
-        STXXLNodeIDVector::iterator usedNodeIDsIT = externalMemory.usedNodeIDs.begin();
-        while(usedNodeIDsIT != externalMemory.usedNodeIDs.end() && nodesIT != externalMemory.allNodes.end()) {
-            if(*usedNodeIDsIT < nodesIT->id){
-                ++usedNodeIDsIT;
-                continue;
-            }
-            if(*usedNodeIDsIT > nodesIT->id) {
-                ++nodesIT;
-                continue;
-            }
-            if(*usedNodeIDsIT == nodesIT->id) {
-            	if(!settings.obeyBollards && nodesIT->bollard)
-            		nodesIT->bollard = false;
-                fout.write((char*)&(*nodesIT), sizeof(_Node));
-                ++usedNodeCounter;
-                ++usedNodeIDsIT;
-                ++nodesIT;
-            }
-        }
-
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-        time = get_timestamp();
-
-        cout << "[extractor] setting number of nodes   ... " << flush;
-        ios::pos_type positionInFile = fout.tellp();
-        fout.seekp(ios::beg);
-        fout.write((char*)&usedNodeCounter, sizeof(unsigned));
-        fout.seekp(positionInFile);
-
-        cout << "ok" << endl;
-        time = get_timestamp();
-
-        // Sort edges by start.
-        cout << "[extractor] Sorting edges by start    ... " << flush;
-        stxxl::sort(externalMemory.allEdges.begin(), externalMemory.allEdges.end(), CmpEdgeByStartID(), memory_to_use);
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-        time = get_timestamp();
-
-        cout << "[extractor] Setting start coords      ... " << flush;
-        fout.write((char*)&usedEdgeCounter, sizeof(unsigned));
-        // Traverse list of edges and nodes in parallel and set start coord
-        nodesIT = externalMemory.allNodes.begin();
-        STXXLEdgeVector::iterator edgeIT = externalMemory.allEdges.begin();
-        while(edgeIT != externalMemory.allEdges.end() && nodesIT != externalMemory.allNodes.end()) {
-            if(edgeIT->start < nodesIT->id){
-                ++edgeIT;
-                continue;
-            }
-            if(edgeIT->start > nodesIT->id) {
-                nodesIT++;
-                continue;
-            }
-            if(edgeIT->start == nodesIT->id) {
-                edgeIT->startCoord.lat = nodesIT->lat;
-                edgeIT->startCoord.lon = nodesIT->lon;
-                ++edgeIT;
-            }
-        }
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-        time = get_timestamp();
-
-        // Sort Edges by target
-        cout << "[extractor] Sorting edges by target   ... " << flush;
-        stxxl::sort(externalMemory.allEdges.begin(), externalMemory.allEdges.end(), CmpEdgeByTargetID(), memory_to_use);
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-        time = get_timestamp();
-
-        cout << "[extractor] Setting target coords     ... " << flush;
-        // Traverse list of edges and nodes in parallel and set target coord
-        nodesIT = externalMemory.allNodes.begin();
-        edgeIT = externalMemory.allEdges.begin();
-
-        while(edgeIT != externalMemory.allEdges.end() && nodesIT != externalMemory.allNodes.end()) {
-            if(edgeIT->target < nodesIT->id){
-                ++edgeIT;
-                continue;
-            }
-            if(edgeIT->target > nodesIT->id) {
-                ++nodesIT;
-                continue;
-            }
-            if(edgeIT->target == nodesIT->id) {
-                if(edgeIT->startCoord.lat != INT_MIN && edgeIT->startCoord.lon != INT_MIN) {
-                    edgeIT->targetCoord.lat = nodesIT->lat;
-                    edgeIT->targetCoord.lon = nodesIT->lon;
-
-                    double distance = ApproximateDistance(edgeIT->startCoord.lat, edgeIT->startCoord.lon, nodesIT->lat, nodesIT->lon);
-                    assert(edgeIT->speed != -1);
-                    double weight = ( distance * 10. ) / (edgeIT->speed / 3.6);
-                    int intWeight = max(1, (int) weight);
-                    int intDist = max(1, (int)distance);
-                    short zero = 0;
-                    short one = 1;
-
-                    fout.write((char*)&edgeIT->start, sizeof(unsigned));
-                    fout.write((char*)&edgeIT->target, sizeof(unsigned));
-                    fout.write((char*)&intDist, sizeof(int));
-                    switch(edgeIT->direction) {
-                    case _Way::notSure:
-                        fout.write((char*)&zero, sizeof(short));
-                        break;
-                    case _Way::oneway:
-                        fout.write((char*)&one, sizeof(short));
-                        break;
-                    case _Way::bidirectional:
-                        fout.write((char*)&zero, sizeof(short));
-
-                        break;
-                    case _Way::opposite:
-                        fout.write((char*)&one, sizeof(short));
-                        break;
-                    default:
-                        cerr << "[error] edge with no direction: " << edgeIT->direction << endl;
-                        assert(false);
-                        break;
-                    }
-                    fout.write((char*)&intWeight, sizeof(int));
-                    assert(edgeIT->type >= 0);
-                    fout.write((char*)&edgeIT->type, sizeof(short));
-                    fout.write((char*)&edgeIT->nameID, sizeof(unsigned));
-                    fout.write((char*)&edgeIT->isRoundabout, sizeof(bool));
-                    fout.write((char*)&edgeIT->ignoreInGrid, sizeof(bool));
-                }
-                ++usedEdgeCounter;
-                ++edgeIT;
-            }
-        }
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-        time = get_timestamp();
-
-        cout << "[extractor] setting number of edges   ... " << flush;
-        fout.seekp(positionInFile);
-        fout.write((char*)&usedEdgeCounter, sizeof(unsigned));
-        fout.close();
-        cout << "ok" << endl;
-        time = get_timestamp();
-        cout << "[extractor] writing street name index ... " << flush;
-        outputFileName.append(".names");
-        ofstream nameOutFile(outputFileName.c_str(), ios::binary);
-        unsigned sizeOfNameIndex = externalMemory.nameVector.size();
-        nameOutFile.write((char *)&(sizeOfNameIndex), sizeof(unsigned));
-
-        BOOST_FOREACH(string str, externalMemory.nameVector) {
-            unsigned lengthOfRawString = strlen(str.c_str());
-            nameOutFile.write((char *)&(lengthOfRawString), sizeof(unsigned));
-            nameOutFile.write(str.c_str(), lengthOfRawString);
-        }
-
-        nameOutFile.close();
-        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-
-        //        time = get_timestamp();
-        //        cout << "[extractor] writing address list      ... " << flush;
-        //
-        //        adressFileName.append(".address");
-        //        ofstream addressOutFile(adressFileName.c_str());
-        //        for(STXXLAddressVector::iterator it = adressVector.begin(); it != adressVector.end(); it++) {
-        //            addressOutFile << it->node.id << "|" << it->node.lat << "|" << it->node.lon << "|" << it->city << "|" << it->street << "|" << it->housenumber << "|" << it->state << "|" << it->country << "\n";
-        //        }
-        //        addressOutFile.close();
-        //        cout << "ok, after " << get_timestamp() - time << "s" << endl;
-
-    } catch ( const exception& e ) {
-        cerr <<  "Caught Execption:" << e.what() << endl;
-        return false;
-    }
-
-    double endTime = (get_timestamp() - startupTime);
-    INFO("Processed " << (usedNodeCounter)/(endTime) << " nodes/sec and " << usedEdgeCounter/endTime << " edges/sec");
-    stringMap.clear();
-    delete parser;
-    delete extractCallBacks;
-    cout << "[extractor] finished." << endl;
     return 0;
-}
-
-bool nodeFunction(_Node n) {
-    extractCallBacks->nodeFunction(n);
-    return true;
-}
-
-bool adressFunction(_Node n, HashTable<string, string> & keyVals){
-    extractCallBacks->adressFunction(n, keyVals);
-    return true;
-}
-
-bool restrictionFunction(_RawRestrictionContainer r) {
-    extractCallBacks->restrictionFunction(r);
-    ++globalRestrictionCounter;
-    return true;
-}
-bool wayFunction(_Way w) {
-    extractCallBacks->wayFunction(w);
-    return true;
 }

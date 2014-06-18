@@ -1,71 +1,83 @@
 require 'socket'
-require 'sys/proctable'
+require 'open3'
 
-class OSRMLauncher
-  def initialize &block
+OSRM_ROUTED_LOG_FILE = 'osrm-routed.log'
+
+class OSRMBackgroundLauncher
+  def initialize input_file, &block
+    @input_file = input_file
     Dir.chdir TEST_FOLDER do
+      begin
+        launch
+        yield
+      ensure
+        shutdown
+      end
+    end
+  end
+
+  private
+
+  def launch
+    Timeout.timeout(OSRM_TIMEOUT) do
       osrm_up
-      yield
+      wait_for_connection
+    end
+  rescue Timeout::Error
+    raise RoutedError.new "Launching osrm-routed timed out."
+  end
+
+  def shutdown
+    Timeout.timeout(OSRM_TIMEOUT) do
       osrm_down
     end
+  rescue Timeout::Error
+    kill
+    raise RoutedError.new "Shutting down osrm-routed timed out."
   end
-end
 
-def each_process name, &block
-  Sys::ProcTable.ps do |process|
-    if process.comm.strip == name.strip
-      yield process.pid.to_i, process.state.strip
+
+  def osrm_up?
+    if @pid
+      `ps -o state -p #{@pid}`.split[1].to_s =~ /^[DRST]/
+    else
+      false
     end
   end
-end
 
-def osrm_up?
-  find_pid('osrm-routed') != nil
-end
+  def osrm_up
+    return if osrm_up?
+    @pid = Process.spawn("#{BIN_PATH}/osrm-routed #{@input_file} --port #{OSRM_PORT}",:out=>OSRM_ROUTED_LOG_FILE, :err=>OSRM_ROUTED_LOG_FILE)
+    Process.detach(@pid)    # avoid zombie processes
+  end
 
-def find_pid name
-  each_process(name) { |pid,state| return pid.to_i }
-  return nil
-end
+  def osrm_down
+    if @pid
+      Process.kill 'TERM', @pid
+      wait_for_shutdown
+    end
+  end
 
-def osrm_up
-  return if osrm_up?
-  pipe = IO.popen('../osrm-routed 1>>osrm-routed.log 2>>osrm-routed.log')
-  timeout = 5
-  (timeout*10).times do
-    begin
-      socket = TCPSocket.new('localhost', 5000)
-      socket.puts 'ping'
-    rescue Errno::ECONNREFUSED
+  def kill
+    if @pid
+      Process.kill 'KILL', @pid
+    end
+  end
+
+  def wait_for_connection
+    while true
+      begin
+        socket = TCPSocket.new('localhost', OSRM_PORT)
+        return
+      rescue Errno::ECONNREFUSED
+        sleep 0.1
+      end
+    end
+  end
+
+  def wait_for_shutdown
+    while osrm_up?
       sleep 0.1
     end
   end
-  sleep 0.1
-end
-
-def osrm_down
-  each_process('osrm-routed') { |pid,state| Process.kill 'TERM', pid }
-  each_process('osrm-prepare') { |pid,state| Process.kill 'TERM', pid }
-  each_process('osrm-extract') { |pid,state| Process.kill 'TERM', pid }
-  wait_for_shutdown 'osrm-routed'
-  wait_for_shutdown 'osrm-prepare'
-  wait_for_shutdown 'osrm-extract'  
-end
-
-def osrm_kill
-  each_process('osrm-routed') { |pid,state| Process.kill 'KILL', pid }
-  each_process('osrm-prepare') { |pid,state| Process.kill 'KILL', pid }
-  each_process('osrm-extract') { |pid,state| Process.kill 'KILL', pid }
-  wait_for_shutdown 'osrm-routed'
-  wait_for_shutdown 'osrm-prepare'
-  wait_for_shutdown 'osrm-extract'  
-end
-
-def wait_for_shutdown name
-  timeout = 10
-  (timeout*10).times do
-    return if find_pid(name) == nil
-    sleep 0.1
-  end
-  raise "*** Could not terminate #{name}."
 end

@@ -1,40 +1,70 @@
 /*
-    open source routing machine
-    Copyright (C) Dennis Luxen, others 2010
 
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU AFFERO General Public License as published by
-the Free Software Foundation; either version 3 of the License, or
-any later version.
+Copyright (c) 2013, Project OSRM, Dennis Luxen, others
+All rights reserved.
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
-You should have received a copy of the GNU Affero General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-or see http://www.gnu.org/licenses/agpl.txt.
- */
+Redistributions of source code must retain the above copyright notice, this list
+of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this
+list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
 
-#ifndef SEGMENTINFORMATION_H_
-#define SEGMENTINFORMATION_H_
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include <climits>
+*/
 
-struct SegmentInformation {
-    _Coordinate location;
-    NodeID nameID;
-    unsigned length;
+#ifndef SEGMENT_INFORMATION_H
+#define SEGMENT_INFORMATION_H
+
+#include "TurnInstructions.h"
+
+#include "../typedefs.h"
+
+#include <osrm/Coordinate.h>
+
+// Struct fits everything in one cache line
+struct SegmentInformation
+{
+    FixedPointCoordinate location;
+    NodeID name_id;
     unsigned duration;
-    double bearing;
-    short turnInstruction;
+    double length;
+    short bearing; // more than enough [0..3600] fits into 12 bits
+    TurnInstruction turn_instruction;
     bool necessary;
-    SegmentInformation(const _Coordinate & loc, const NodeID nam, const unsigned len, const unsigned dur, const short tInstr, const bool nec) :
-            location(loc), nameID(nam), length(len), duration(dur), bearing(0.), turnInstruction(tInstr), necessary(nec) {}
-    SegmentInformation(const _Coordinate & loc, const NodeID nam, const unsigned len, const unsigned dur, const short tInstr) :
-        location(loc), nameID(nam), length(len), duration(dur), bearing(0.), turnInstruction(tInstr), necessary(tInstr != 0) {}
+
+    explicit SegmentInformation(const FixedPointCoordinate &location,
+                                const NodeID name_id,
+                                const unsigned duration,
+                                const double length,
+                                const TurnInstruction turn_instruction,
+                                const bool necessary)
+        : location(location), name_id(name_id), duration(duration), length(length), bearing(0),
+          turn_instruction(turn_instruction), necessary(necessary)
+    {
+    }
+
+    explicit SegmentInformation(const FixedPointCoordinate &location,
+                                const NodeID name_id,
+                                const unsigned duration,
+                                const double length,
+                                const TurnInstruction turn_instruction)
+        : location(location), name_id(name_id), duration(duration), length(length), bearing(0),
+          turn_instruction(turn_instruction), necessary(turn_instruction != TurnInstruction::NoTurn)
+    {
+    }
 };
 
-#endif /* SEGMENTINFORMATION_H_ */
+#endif /* SEGMENT_INFORMATION_H */

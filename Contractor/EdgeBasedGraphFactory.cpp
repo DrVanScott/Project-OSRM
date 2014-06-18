@@ -1,293 +1,775 @@
 /*
- open source routing machine
- Copyright (C) Dennis Luxen, others 2010
 
- This program is free software; you can redistribute it and/or modify
- it under the terms of the GNU AFFERO General Public License as published by
- the Free Software Foundation; either version 3 of the License, or
- any later version.
+Copyright (c) 2013, Project OSRM, Dennis Luxen, others
+All rights reserved.
 
- This program is distributed in the hope that it will be useful,
- but WITHOUT ANY WARRANTY; without even the implied warranty of
- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- GNU General Public License for more details.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
- You should have received a copy of the GNU Affero General Public License
- along with this program; if not, write to the Free Software
- Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- or see http://www.gnu.org/licenses/agpl.txt.
- */
+Redistributions of source code must retain the above copyright notice, this list
+of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this
+list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
 
-#include <algorithm>
-#include <boost/foreach.hpp>
-#include <boost/lexical_cast.hpp>
-#include <boost/property_tree/ptree.hpp>
-#include <boost/property_tree/ini_parser.hpp>
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include "../Util/OpenMPReplacement.h"
+*/
+
 #include "EdgeBasedGraphFactory.h"
+#include "../Algorithms/BFSComponentExplorer.h"
+#include "../DataStructures/Percent.h"
+#include "../Util/ComputeAngle.h"
+#include "../Util/LuaUtil.h"
+#include "../Util/SimpleLogger.h"
+#include "../Util/TimingUtil.h"
 
-template<>
-EdgeBasedGraphFactory::EdgeBasedGraphFactory(int nodes, std::vector<NodeBasedEdge> & inputEdges, std::vector<NodeID> & bn, std::vector<NodeID> & tl, std::vector<_Restriction> & irs, std::vector<NodeInfo> & nI, boost::property_tree::ptree speedProfile, std::string & srtm) : inputNodeInfoList(nI), numberOfTurnRestrictions(irs.size()) {
-    INFO("Nodes size: " << inputNodeInfoList.size());
-    BOOST_FOREACH(_Restriction & restriction, irs) {
-        std::pair<NodeID, NodeID> restrictionSource = std::make_pair(restriction.fromNode, restriction.viaNode);
-        unsigned index;
-        RestrictionMap::iterator restrIter = _restrictionMap.find(restrictionSource);
-        if(restrIter == _restrictionMap.end()) {
-            index = _restrictionBucketVector.size();
-            _restrictionBucketVector.resize(index+1);
-            _restrictionMap[restrictionSource] = index;
-        } else {
-            index = restrIter->second;
-            //Map already contains an is_only_*-restriction
-            if(_restrictionBucketVector.at(index).begin()->second)
-                continue;
-            else if(restriction.flags.isOnly){
-                //We are going to insert an is_only_*-restriction. There can be only one.
-                _restrictionBucketVector.at(index).clear();
-            }
-        }
+#include <boost/assert.hpp>
 
-        _restrictionBucketVector.at(index).push_back(std::make_pair(restriction.toNode, restriction.flags.isOnly));
+#include <fstream>
+#include <limits>
+
+EdgeBasedGraphFactory::EdgeBasedGraphFactory(
+    const std::shared_ptr<NodeBasedDynamicGraph> &node_based_graph,
+    std::unique_ptr<RestrictionMap> restriction_map,
+    std::vector<NodeID> &barrier_node_list,
+    std::vector<NodeID> &traffic_light_node_list,
+    std::vector<NodeInfo> &m_node_info_list,
+    SpeedProfileProperties &speed_profile)
+    : speed_profile(speed_profile),
+      m_number_of_edge_based_nodes(std::numeric_limits<unsigned>::max()),
+      m_node_info_list(m_node_info_list), m_node_based_graph(node_based_graph),
+      m_restriction_map(std::move(restriction_map)), max_id(0)
+{
+
+    // insert into unordered sets for fast lookup
+    m_barrier_nodes.insert(barrier_node_list.begin(), barrier_node_list.end());
+    m_traffic_lights.insert(traffic_light_node_list.begin(), traffic_light_node_list.end());
+}
+
+void EdgeBasedGraphFactory::GetEdgeBasedEdges(DeallocatingVector<EdgeBasedEdge> &output_edge_list)
+{
+    BOOST_ASSERT_MSG(0 == output_edge_list.size(), "Vector is not empty");
+    m_edge_based_edge_list.swap(output_edge_list);
+}
+
+void EdgeBasedGraphFactory::GetEdgeBasedNodes(std::vector<EdgeBasedNode> &nodes)
+{
+#ifndef NDEBUG
+    for (const EdgeBasedNode &node : m_edge_based_node_list)
+    {
+        BOOST_ASSERT(m_node_info_list.at(node.u).lat != INT_MAX);
+        BOOST_ASSERT(m_node_info_list.at(node.u).lon != INT_MAX);
+        BOOST_ASSERT(m_node_info_list.at(node.v).lon != INT_MAX);
+        BOOST_ASSERT(m_node_info_list.at(node.v).lat != INT_MAX);
+    }
+#endif
+    nodes.swap(m_edge_based_node_list);
+}
+
+void
+EdgeBasedGraphFactory::InsertEdgeBasedNode(NodeID u, NodeID v, EdgeID e1, bool belongs_to_tiny_cc)
+{
+    // merge edges together into one EdgeBasedNode
+    BOOST_ASSERT(u != SPECIAL_NODEID);
+    BOOST_ASSERT(v != SPECIAL_NODEID);
+    BOOST_ASSERT(e1 != SPECIAL_EDGEID);
+
+#ifndef NDEBUG
+    // find forward edge id and
+    const EdgeID e1b = m_node_based_graph->FindEdge(u, v);
+    BOOST_ASSERT(e1 == e1b);
+#endif
+
+    BOOST_ASSERT(e1 != SPECIAL_EDGEID);
+    const EdgeData &forward_data = m_node_based_graph->GetEdgeData(e1);
+
+    // find reverse edge id and
+    const EdgeID e2 = m_node_based_graph->FindEdge(v, u);
+
+#ifndef NDEBUG
+    if (e2 == m_node_based_graph->EndEdges(v))
+    {
+        SimpleLogger().Write(logWARNING) << "Did not find edge (" << v << "," << u << ")";
+    }
+#endif
+    BOOST_ASSERT(e2 != SPECIAL_EDGEID);
+    BOOST_ASSERT(e2 < m_node_based_graph->EndEdges(v));
+    const EdgeData &reverse_data = m_node_based_graph->GetEdgeData(e2);
+
+    if (forward_data.edgeBasedNodeID == SPECIAL_NODEID &&
+        reverse_data.edgeBasedNodeID == SPECIAL_NODEID)
+    {
+        return;
     }
 
-    std::string usedSpeedProfile(speedProfile.get_child("").begin()->first);
-    BOOST_FOREACH(boost::property_tree::ptree::value_type &v, speedProfile.get_child(usedSpeedProfile)) {
-        if("trafficSignalPenalty" ==  v.first) {
-            std::string value = v.second.get<std::string>("");
-            try {
-                trafficSignalPenalty = 10*boost::lexical_cast<int>(v.second.get<std::string>(""));
-            } catch(boost::bad_lexical_cast &) {
-                trafficSignalPenalty = 0;
-            }
+    BOOST_ASSERT(m_geometry_compressor.HasEntryForID(e1) ==
+                 m_geometry_compressor.HasEntryForID(e2));
+    if (m_geometry_compressor.HasEntryForID(e1))
+    {
+        BOOST_ASSERT(m_geometry_compressor.HasEntryForID(e2));
+
+        // reconstruct geometry and put in each individual edge with its offset
+        const std::vector<GeometryCompressor::CompressedNode> &forward_geometry =
+            m_geometry_compressor.GetBucketReference(e1);
+        const std::vector<GeometryCompressor::CompressedNode> &reverse_geometry =
+            m_geometry_compressor.GetBucketReference(e2);
+        BOOST_ASSERT(forward_geometry.size() == reverse_geometry.size());
+        BOOST_ASSERT(0 != forward_geometry.size());
+
+        // reconstruct bidirectional edge with individual weights and put each into the NN index
+
+        std::vector<int> forward_dist_prefix_sum(forward_geometry.size(), 0);
+        std::vector<int> reverse_dist_prefix_sum(reverse_geometry.size(), 0);
+
+        // quick'n'dirty prefix sum as std::partial_sum needs addtional casts
+        // TODO: move to lambda function with C++11
+        int temp_sum = 0;
+
+        for (unsigned i = 0; i < forward_geometry.size(); ++i)
+        {
+            forward_dist_prefix_sum[i] = temp_sum;
+            temp_sum += forward_geometry[i].second;
+
+            BOOST_ASSERT(forward_data.distance >= temp_sum);
         }
+
+        temp_sum = 0;
+        for (unsigned i = 0; i < reverse_geometry.size(); ++i)
+        {
+            temp_sum += reverse_geometry[reverse_geometry.size() - 1 - i].second;
+            reverse_dist_prefix_sum[i] = reverse_data.distance - temp_sum;
+            BOOST_ASSERT(reverse_data.distance >= temp_sum);
+        }
+
+        BOOST_ASSERT(forward_geometry.size() == reverse_geometry.size());
+
+        const unsigned geometry_size = forward_geometry.size();
+        BOOST_ASSERT(geometry_size > 1);
+        NodeID current_edge_start_coordinate_id = u;
+
+        if (forward_data.edgeBasedNodeID != SPECIAL_NODEID)
+        {
+            max_id = std::max(forward_data.edgeBasedNodeID, max_id);
+        }
+        if (SPECIAL_NODEID != reverse_data.edgeBasedNodeID)
+        {
+            max_id = std::max(reverse_data.edgeBasedNodeID, max_id);
+        }
+
+        // traverse arrays from start and end respectively
+        for (unsigned i = 0; i < geometry_size; ++i)
+        {
+            BOOST_ASSERT(current_edge_start_coordinate_id ==
+                         reverse_geometry[geometry_size - 1 - i].first);
+            const NodeID current_edge_target_coordinate_id = forward_geometry[i].first;
+            BOOST_ASSERT(current_edge_target_coordinate_id != current_edge_start_coordinate_id);
+
+            // build edges
+            m_edge_based_node_list.emplace_back(forward_data.edgeBasedNodeID,
+                                                reverse_data.edgeBasedNodeID,
+                                                current_edge_start_coordinate_id,
+                                                current_edge_target_coordinate_id,
+                                                forward_data.nameID,
+                                                forward_geometry[i].second,
+                                                reverse_geometry[i].second,
+                                                forward_dist_prefix_sum[i],
+                                                reverse_dist_prefix_sum[i],
+                                                m_geometry_compressor.GetPositionForID(e1),
+                                                i,
+                                                belongs_to_tiny_cc);
+            current_edge_start_coordinate_id = current_edge_target_coordinate_id;
+
+            BOOST_ASSERT(m_edge_based_node_list.back().IsCompressed());
+
+            BOOST_ASSERT(u != m_edge_based_node_list.back().u ||
+                         v != m_edge_based_node_list.back().v);
+
+            BOOST_ASSERT(u != m_edge_based_node_list.back().v ||
+                         v != m_edge_based_node_list.back().u);
+        }
+
+        BOOST_ASSERT(current_edge_start_coordinate_id == v);
+        BOOST_ASSERT(m_edge_based_node_list.back().IsCompressed());
     }
+    else
+    {
+        BOOST_ASSERT(!m_geometry_compressor.HasEntryForID(e2));
 
-    BOOST_FOREACH(NodeID id, bn)
-        _barrierNodes[id] = true;
-    BOOST_FOREACH(NodeID id, tl)
-        _trafficLights[id] = true;
+        if (forward_data.edgeBasedNodeID != SPECIAL_NODEID)
+        {
+            BOOST_ASSERT(forward_data.forward);
+        }
+        if (reverse_data.edgeBasedNodeID != SPECIAL_NODEID)
+        {
+            BOOST_ASSERT(reverse_data.forward);
+        }
+        if (forward_data.edgeBasedNodeID == SPECIAL_NODEID)
+        {
+            BOOST_ASSERT(!forward_data.forward);
+        }
+        if (reverse_data.edgeBasedNodeID == SPECIAL_NODEID)
+        {
+            BOOST_ASSERT(!reverse_data.forward);
+        }
 
-    std::vector< _NodeBasedEdge > edges;
-    edges.reserve( 2 * inputEdges.size() );
-    for ( std::vector< NodeBasedEdge >::const_iterator i = inputEdges.begin(), e = inputEdges.end(); i != e; ++i ) {
-        _NodeBasedEdge edge;
-        edge.source = i->source();
-        edge.target = i->target();
+        BOOST_ASSERT(forward_data.edgeBasedNodeID != SPECIAL_NODEID ||
+                     reverse_data.edgeBasedNodeID != SPECIAL_NODEID);
 
-        if(edge.source == edge.target)
+        m_edge_based_node_list.emplace_back(EdgeBasedNode(forward_data.edgeBasedNodeID,
+                                                          reverse_data.edgeBasedNodeID,
+                                                          u,
+                                                          v,
+                                                          forward_data.nameID,
+                                                          forward_data.distance,
+                                                          reverse_data.distance,
+                                                          0,
+                                                          0,
+                                                          SPECIAL_EDGEID,
+                                                          0,
+                                                          belongs_to_tiny_cc));
+        BOOST_ASSERT(!m_edge_based_node_list.back().IsCompressed());
+    }
+}
+
+void EdgeBasedGraphFactory::FlushVectorToStream(
+    std::ofstream &edge_data_file, std::vector<OriginalEdgeData> &original_edge_data_vector) const
+{
+    edge_data_file.write((char *)&(original_edge_data_vector[0]),
+                         original_edge_data_vector.size() * sizeof(OriginalEdgeData));
+    original_edge_data_vector.clear();
+}
+
+void EdgeBasedGraphFactory::Run(const std::string &original_edge_data_filename,
+                                const std::string &geometry_filename,
+                                lua_State *lua_state)
+{
+
+    TIMER_START(geometry);
+    CompressGeometry();
+    TIMER_STOP(geometry);
+
+    TIMER_START(renumber);
+    RenumberEdges();
+    TIMER_STOP(renumber);
+
+    TIMER_START(generate_nodes);
+    GenerateEdgeExpandedNodes();
+    TIMER_STOP(generate_nodes);
+
+    TIMER_START(generate_edges);
+    GenerateEdgeExpandedEdges(original_edge_data_filename, lua_state);
+    TIMER_STOP(generate_edges);
+
+    m_geometry_compressor.SerializeInternalVector(geometry_filename);
+
+    SimpleLogger().Write() << "Timing statistics for edge-expanded graph:";
+    SimpleLogger().Write() << "Geometry compression: " << TIMER_MSEC(geometry)*0.001 << "s";
+    SimpleLogger().Write() << "Renumbering edges: " << TIMER_MSEC(renumber)*0.001 << "s";
+    SimpleLogger().Write() << "Generating nodes: " << TIMER_MSEC(generate_nodes)*0.001 << "s";
+    SimpleLogger().Write() << "Generating edges: " << TIMER_MSEC(generate_edges)*0.001 << "s";
+}
+
+void EdgeBasedGraphFactory::CompressGeometry()
+{
+    SimpleLogger().Write() << "Removing graph geometry while preserving topology";
+
+    const unsigned original_number_of_nodes = m_node_based_graph->GetNumberOfNodes();
+    const unsigned original_number_of_edges = m_node_based_graph->GetNumberOfEdges();
+
+    Percent p(original_number_of_nodes);
+    unsigned removed_node_count = 0;
+
+    for (NodeID v = 0; v < original_number_of_nodes; ++v)
+    {
+        p.printStatus(v);
+
+        // only contract degree 2 vertices
+        if (2 != m_node_based_graph->GetOutDegree(v))
+        {
             continue;
-
-        edge.data.distance = (std::max)((int)i->weight(), 1 );
-        assert( edge.data.distance > 0 );
-        edge.data.shortcut = false;
-        edge.data.roundabout = i->isRoundabout();
-        edge.data.ignoreInGrid = i->ignoreInGrid();
-        edge.data.nameID = i->name();
-        edge.data.type = i->type();
-        edge.data.forward = i->isForward();
-        edge.data.backward = i->isBackward();
-        edge.data.edgeBasedNodeID = edges.size();
-        edges.push_back( edge );
-        if( edge.data.backward ) {
-            std::swap( edge.source, edge.target );
-            edge.data.forward = i->isBackward();
-            edge.data.backward = i->isForward();
-            edge.data.edgeBasedNodeID = edges.size();
-            edges.push_back( edge );
         }
-    }
 
-    sort( edges.begin(), edges.end() );
+        // don't contract barrier node
+        if (m_barrier_nodes.end() != m_barrier_nodes.find(v))
+        {
+            continue;
+        }
 
-    _nodeBasedGraph.reset(new _NodeBasedDynamicGraph( nodes, edges ));
-    INFO("Converted " << inputEdges.size() << " node-based edges into " << _nodeBasedGraph->GetNumberOfEdges() << " edge-based nodes.");
-}
+        // check if v is a via node for a turn restriction, i.e. a 'directed' barrier node
+        if (m_restriction_map->IsNodeAViaNode(v))
+        {
+            continue;
+        }
 
-template<>
-void EdgeBasedGraphFactory::GetEdgeBasedEdges( std::vector< EdgeBasedEdge >& outputEdgeList ) {
+        const bool reverse_edge_order =
+            !(m_node_based_graph->GetEdgeData(m_node_based_graph->BeginEdges(v)).forward);
+        const EdgeID forward_e2 = m_node_based_graph->BeginEdges(v) + reverse_edge_order;
+        BOOST_ASSERT(SPECIAL_EDGEID != forward_e2);
+        const EdgeID reverse_e2 = m_node_based_graph->BeginEdges(v) + 1 - reverse_edge_order;
+        BOOST_ASSERT(SPECIAL_EDGEID != reverse_e2);
 
-    GUARANTEE(0 == outputEdgeList.size(), "Vector passed to EdgeBasedGraphFactory::GetEdgeBasedEdges(..) is not empty");
-    GUARANTEE(0 != edgeBasedEdges.size(), "No edges in edge based graph");
+        const EdgeData &fwd_edge_data2 = m_node_based_graph->GetEdgeData(forward_e2);
+        const EdgeData &rev_edge_data2 = m_node_based_graph->GetEdgeData(reverse_e2);
 
-    edgeBasedEdges.swap(outputEdgeList);
-}
+        const NodeID w = m_node_based_graph->GetTarget(forward_e2);
+        BOOST_ASSERT(SPECIAL_NODEID != w);
+        BOOST_ASSERT(v != w);
+        const NodeID u = m_node_based_graph->GetTarget(reverse_e2);
+        BOOST_ASSERT(SPECIAL_NODEID != u);
+        BOOST_ASSERT(u != v);
 
-void EdgeBasedGraphFactory::GetEdgeBasedNodes( std::vector< EdgeBasedNode> & nodes) {
-    BOOST_FOREACH(EdgeBasedNode & node, edgeBasedNodes){
-        assert(node.lat1 != INT_MAX); assert(node.lon1 != INT_MAX);
-        assert(node.lat2 != INT_MAX); assert(node.lon2 != INT_MAX);
-    }
-    nodes.swap(edgeBasedNodes);
-}
+        const EdgeID forward_e1 = m_node_based_graph->FindEdge(u, v);
+        BOOST_ASSERT(m_node_based_graph->EndEdges(u) != forward_e1);
+        BOOST_ASSERT(SPECIAL_EDGEID != forward_e1);
+        BOOST_ASSERT(v == m_node_based_graph->GetTarget(forward_e1));
+        const EdgeID reverse_e1 = m_node_based_graph->FindEdge(w, v);
+        BOOST_ASSERT(SPECIAL_EDGEID != reverse_e1);
+        BOOST_ASSERT(v == m_node_based_graph->GetTarget(reverse_e1));
 
-NodeID EdgeBasedGraphFactory::CheckForEmanatingIsOnlyTurn(const NodeID u, const NodeID v) const {
-    std::pair < NodeID, NodeID > restrictionSource = std::make_pair(u, v);
-    RestrictionMap::const_iterator restrIter = _restrictionMap.find(restrictionSource);
-    if (restrIter != _restrictionMap.end()) {
-        unsigned index = restrIter->second;
-        BOOST_FOREACH(RestrictionSource restrictionTarget, _restrictionBucketVector.at(index)) {
-            if(restrictionTarget.second) {
-                return restrictionTarget.first;
+        const EdgeData &fwd_edge_data1 = m_node_based_graph->GetEdgeData(forward_e1);
+        const EdgeData &rev_edge_data1 = m_node_based_graph->GetEdgeData(reverse_e1);
+
+        if ((m_node_based_graph->FindEdge(u, w) != m_node_based_graph->EndEdges(u)) ||
+            (m_node_based_graph->FindEdge(w, u) != m_node_based_graph->EndEdges(w)))
+        {
+            continue;
+        }
+
+        if ( // TODO: rename to IsCompatibleTo
+                fwd_edge_data1.IsEqualTo(fwd_edge_data2) &&
+                rev_edge_data1.IsEqualTo(rev_edge_data2))
+        {
+            // Get distances before graph is modified
+            const int forward_weight1 = m_node_based_graph->GetEdgeData(forward_e1).distance;
+            const int forward_weight2 = m_node_based_graph->GetEdgeData(forward_e2).distance;
+
+            BOOST_ASSERT(0 != forward_weight1);
+            BOOST_ASSERT(0 != forward_weight2);
+
+            const int reverse_weight1 = m_node_based_graph->GetEdgeData(reverse_e1).distance;
+            const int reverse_weight2 = m_node_based_graph->GetEdgeData(reverse_e2).distance;
+
+            BOOST_ASSERT(0 != reverse_weight1);
+            BOOST_ASSERT(0 != forward_weight2);
+
+            const bool add_traffic_signal_penalty =
+                (m_traffic_lights.find(v) != m_traffic_lights.end());
+
+            // add weight of e2's to e1
+            m_node_based_graph->GetEdgeData(forward_e1).distance += fwd_edge_data2.distance;
+            m_node_based_graph->GetEdgeData(reverse_e1).distance += rev_edge_data2.distance;
+            if (add_traffic_signal_penalty)
+            {
+                m_node_based_graph->GetEdgeData(forward_e1).distance +=
+                    speed_profile.trafficSignalPenalty;
+                m_node_based_graph->GetEdgeData(reverse_e1).distance +=
+                    speed_profile.trafficSignalPenalty;
             }
+
+            // extend e1's to targets of e2's
+            m_node_based_graph->SetTarget(forward_e1, w);
+            m_node_based_graph->SetTarget(reverse_e1, u);
+
+            // remove e2's (if bidir, otherwise only one)
+            m_node_based_graph->DeleteEdge(v, forward_e2);
+            m_node_based_graph->DeleteEdge(v, reverse_e2);
+
+            // update any involved turn restrictions
+            m_restriction_map->FixupStartingTurnRestriction(u, v, w);
+            m_restriction_map->FixupArrivingTurnRestriction(u, v, w);
+
+            m_restriction_map->FixupStartingTurnRestriction(w, v, u);
+            m_restriction_map->FixupArrivingTurnRestriction(w, v, u);
+
+            // store compressed geometry in container
+            m_geometry_compressor.CompressEdge(
+                forward_e1,
+                forward_e2,
+                v,
+                w,
+                forward_weight1 +
+                    (add_traffic_signal_penalty ? speed_profile.trafficSignalPenalty : 0),
+                forward_weight2);
+            m_geometry_compressor.CompressEdge(
+                reverse_e1,
+                reverse_e2,
+                v,
+                u,
+                reverse_weight1,
+                reverse_weight2 +
+                    (add_traffic_signal_penalty ? speed_profile.trafficSignalPenalty : 0));
+            ++removed_node_count;
+
+            BOOST_ASSERT(m_node_based_graph->GetEdgeData(forward_e1).nameID ==
+                         m_node_based_graph->GetEdgeData(reverse_e1).nameID);
         }
     }
-    return UINT_MAX;
-}
+    SimpleLogger().Write() << "removed " << removed_node_count << " nodes";
+    m_geometry_compressor.PrintStatistics();
 
-bool EdgeBasedGraphFactory::CheckIfTurnIsRestricted(const NodeID u, const NodeID v, const NodeID w) const {
-    //only add an edge if turn is not a U-turn except it is the end of dead-end street.
-    std::pair < NodeID, NodeID > restrictionSource = std::make_pair(u, v);
-    RestrictionMap::const_iterator restrIter = _restrictionMap.find(restrictionSource);
-    if (restrIter != _restrictionMap.end()) {
-        unsigned index = restrIter->second;
-        BOOST_FOREACH(RestrictionTarget restrictionTarget, _restrictionBucketVector.at(index)) {
-            if(w == restrictionTarget.first)
-                return true;
+    unsigned new_node_count = 0;
+    unsigned new_edge_count = 0;
+    for (unsigned i = 0; i < m_node_based_graph->GetNumberOfNodes(); ++i)
+    {
+        if (m_node_based_graph->GetOutDegree(i) > 0)
+        {
+            ++new_node_count;
+            new_edge_count += (m_node_based_graph->EndEdges(i) - m_node_based_graph->BeginEdges(i));
         }
     }
-    return false;
+    SimpleLogger().Write() << "new nodes: " << new_node_count << ", edges " << new_edge_count;
+    SimpleLogger().Write() << "Node compression ratio: " << new_node_count /
+                                                                (double)original_number_of_nodes;
+    SimpleLogger().Write() << "Edge compression ratio: " << new_edge_count /
+                                                                (double)original_number_of_edges;
 }
 
-void EdgeBasedGraphFactory::InsertEdgeBasedNode(
-        _NodeBasedDynamicGraph::EdgeIterator e1,
-        _NodeBasedDynamicGraph::NodeIterator u,
-        _NodeBasedDynamicGraph::NodeIterator v) {
-    EdgeBasedNode currentNode;
-    currentNode.nameID = _nodeBasedGraph->GetEdgeData(e1).nameID;
-    currentNode.lat1 = inputNodeInfoList[u].lat;
-    currentNode.lon1 = inputNodeInfoList[u].lon;
-    currentNode.lat2 = inputNodeInfoList[v].lat;
-    currentNode.lon2 = inputNodeInfoList[v].lon;
-    currentNode.id = _nodeBasedGraph->GetEdgeData(e1).edgeBasedNodeID;
-    currentNode.ignoreInGrid = _nodeBasedGraph->GetEdgeData(e1).ignoreInGrid;
-    currentNode.weight = _nodeBasedGraph->GetEdgeData(e1).distance;
-    //currentNode.weight += ComputeHeightPenalty(u, v);
-    edgeBasedNodes.push_back(currentNode);
-}
-
-void EdgeBasedGraphFactory::Run() {
-    INFO("Generating edge based representation of input data");
-    edgeBasedNodes.reserve(_nodeBasedGraph->GetNumberOfEdges());
-    Percent p(_nodeBasedGraph->GetNumberOfNodes());
-    int numberOfSkippedTurns(0);
-    int nodeBasedEdgeCounter(0);
-
-    //loop over all edges and generate new set of nodes.
-    for(_NodeBasedDynamicGraph::NodeIterator u = 0; u < _nodeBasedGraph->GetNumberOfNodes(); ++u ) {
-        for(_NodeBasedDynamicGraph::EdgeIterator e1 = _nodeBasedGraph->BeginEdges(u); e1 < _nodeBasedGraph->EndEdges(u); ++e1) {
-            _NodeBasedDynamicGraph::NodeIterator v = _nodeBasedGraph->GetTarget(e1);
-
-            if(_nodeBasedGraph->GetEdgeData(e1).type != SHRT_MAX) {
-                InsertEdgeBasedNode(e1, u, v);
+/**
+ * Writes the id of the edge in the edge expanded graph (into the egde in the node based graph)
+ */
+void EdgeBasedGraphFactory::RenumberEdges()
+{
+    // renumber edge based node IDs
+    unsigned numbered_edges_count = 0;
+    for (NodeID current_node = 0; current_node < m_node_based_graph->GetNumberOfNodes();
+         ++current_node)
+    {
+        for (EdgeID current_edge : m_node_based_graph->GetAdjacentEdgeRange(current_node))
+        {
+            EdgeData &edge_data = m_node_based_graph->GetEdgeData(current_edge);
+            if (!edge_data.forward)
+            {
+                continue;
             }
+
+            BOOST_ASSERT(numbered_edges_count < m_node_based_graph->GetNumberOfEdges());
+            edge_data.edgeBasedNodeID = numbered_edges_count;
+            ++numbered_edges_count;
+
+            BOOST_ASSERT(SPECIAL_NODEID != edge_data.edgeBasedNodeID);
+        }
+    }
+    m_number_of_edge_based_nodes = numbered_edges_count;
+}
+
+/**
+ * Creates the nodes in the edge expanded graph from edges in the node-based graph.
+ */
+void EdgeBasedGraphFactory::GenerateEdgeExpandedNodes()
+{
+    SimpleLogger().Write() << "Identifying components of the road network";
+
+    // Run a BFS on the undirected graph and identify small components
+    BFSComponentExplorer<NodeBasedDynamicGraph> component_explorer(
+        *m_node_based_graph, *m_restriction_map, m_barrier_nodes);
+
+    component_explorer.run();
+
+    SimpleLogger().Write() << "identified: " << component_explorer.GetNumberOfComponents()
+                           << " many components";
+    SimpleLogger().Write() << "generating edge-expanded nodes";
+
+    Percent p(m_node_based_graph->GetNumberOfNodes());
+
+    // loop over all edges and generate new set of nodes
+    for (NodeID u = 0, end = m_node_based_graph->GetNumberOfNodes(); u < end; ++u)
+    {
+        BOOST_ASSERT(u != SPECIAL_NODEID);
+        BOOST_ASSERT(u < m_node_based_graph->GetNumberOfNodes());
+        p.printIncrement();
+        for (EdgeID e1 : m_node_based_graph->GetAdjacentEdgeRange(u))
+        {
+            const EdgeData &edge_data = m_node_based_graph->GetEdgeData(e1);
+            if (edge_data.edgeBasedNodeID == SPECIAL_NODEID)
+            {
+                // continue;
+            }
+            BOOST_ASSERT(e1 != SPECIAL_EDGEID);
+            const NodeID v = m_node_based_graph->GetTarget(e1);
+
+            BOOST_ASSERT(SPECIAL_NODEID != v);
+            // pick only every other edge
+            if (u > v)
+            {
+                continue;
+            }
+
+            BOOST_ASSERT(u < v);
+            BOOST_ASSERT(edge_data.type != SHRT_MAX);
+
+            // Note: edges that end on barrier nodes or on a turn restriction
+            // may actually be in two distinct components. We choose the smallest
+            const unsigned size_of_component = std::min(component_explorer.GetComponentSize(u),
+                                                        component_explorer.GetComponentSize(v));
+
+            const bool component_is_tiny = (size_of_component < 1000);
+            InsertEdgeBasedNode(u, v, e1, component_is_tiny);
         }
     }
 
-    //Loop over all turns and generate new set of edges.
-    //Three nested loop look super-linear, but we are dealing with a linear number of turns only.
-    for(_NodeBasedDynamicGraph::NodeIterator u = 0; u < _nodeBasedGraph->GetNumberOfNodes(); ++u ) {
-        for(_NodeBasedDynamicGraph::EdgeIterator e1 = _nodeBasedGraph->BeginEdges(u); e1 < _nodeBasedGraph->EndEdges(u); ++e1) {
-            _NodeBasedDynamicGraph::NodeIterator v = _nodeBasedGraph->GetTarget(e1);
-            //EdgeWeight heightPenalty = ComputeHeightPenalty(u, v);
-            NodeID onlyToNode = CheckForEmanatingIsOnlyTurn(u, v);
-            for(_NodeBasedDynamicGraph::EdgeIterator e2 = _nodeBasedGraph->BeginEdges(v); e2 < _nodeBasedGraph->EndEdges(v); ++e2) {
-                _NodeBasedDynamicGraph::NodeIterator w = _nodeBasedGraph->GetTarget(e2);
+    SimpleLogger().Write() << "Generated " << m_edge_based_node_list.size()
+                           << " nodes in edge-expanded graph";
+}
 
-                if(onlyToNode != UINT_MAX && w != onlyToNode) { //We are at an only_-restriction but not at the right turn.
-                    ++numberOfSkippedTurns;
+/**
+ * Actually it also generates OriginalEdgeData and serializes them...
+ */
+void
+EdgeBasedGraphFactory::GenerateEdgeExpandedEdges(const std::string &original_edge_data_filename,
+                                                 lua_State *lua_state)
+{
+    SimpleLogger().Write() << "generating edge-expanded edges";
+
+    unsigned node_based_edge_counter = 0;
+    unsigned original_edges_counter = 0;
+
+    std::ofstream edge_data_file(original_edge_data_filename.c_str(), std::ios::binary);
+
+    // writes a dummy value that is updated later
+    edge_data_file.write((char *)&original_edges_counter, sizeof(unsigned));
+
+    std::vector<OriginalEdgeData> original_edge_data_vector;
+    original_edge_data_vector.reserve(1024 * 1024);
+
+    // Loop over all turns and generate new set of edges.
+    // Three nested loop look super-linear, but we are dealing with a (kind of)
+    // linear number of turns only.
+    unsigned restricted_turns_counter = 0;
+    unsigned skipped_uturns_counter = 0;
+    unsigned skipped_barrier_turns_counter = 0;
+    unsigned compressed = 0;
+
+    Percent p(m_node_based_graph->GetNumberOfNodes());
+
+    for (NodeID u = 0, end = m_node_based_graph->GetNumberOfNodes(); u < end; ++u)
+    {
+        for (EdgeID e1 : m_node_based_graph->GetAdjacentEdgeRange(u))
+        {
+            if (!m_node_based_graph->GetEdgeData(e1).forward)
+            {
+                continue;
+            }
+
+            ++node_based_edge_counter;
+            const NodeID v = m_node_based_graph->GetTarget(e1);
+            const NodeID to_node_of_only_restriction =
+                m_restriction_map->CheckForEmanatingIsOnlyTurn(u, v);
+            const bool is_barrier_node = (m_barrier_nodes.find(v) != m_barrier_nodes.end());
+
+            for (EdgeID e2 : m_node_based_graph->GetAdjacentEdgeRange(v))
+            {
+                if (!m_node_based_graph->GetEdgeData(e2).forward)
+                {
                     continue;
                 }
-                bool isBollardNode = (_barrierNodes.find(v) != _barrierNodes.end());
-                if( (!isBollardNode && (u != w || 1 == _nodeBasedGraph->GetOutDegree(v))) || ((u == w) && isBollardNode)) { //only add an edge if turn is not a U-turn except it is the end of dead-end street.
-                    if (!CheckIfTurnIsRestricted(u, v, w) || (onlyToNode != UINT_MAX && w == onlyToNode)) { //only add an edge if turn is not prohibited
-                        const _NodeBasedDynamicGraph::EdgeData edgeData1 = _nodeBasedGraph->GetEdgeData(e1);
-                        const _NodeBasedDynamicGraph::EdgeData edgeData2 = _nodeBasedGraph->GetEdgeData(e2);
-                        assert(edgeData1.edgeBasedNodeID < _nodeBasedGraph->GetNumberOfEdges());
-                        assert(edgeData2.edgeBasedNodeID < _nodeBasedGraph->GetNumberOfEdges());
+                const NodeID w = m_node_based_graph->GetTarget(e2);
 
-                        unsigned distance = edgeData1.distance;
-                        //distance += heightPenalty;
-                        //distance += ComputeTurnPenalty(u, v, w);
-                        if(_trafficLights.find(v) != _trafficLights.end()) {
-                            distance += trafficSignalPenalty;
-                        }
-                        short turnInstruction = AnalyzeTurn(u, v, w);
-                        EdgeBasedEdge newEdge(edgeData1.edgeBasedNodeID, edgeData2.edgeBasedNodeID, v,  edgeData2.nameID, distance, true, false, turnInstruction);
-                        edgeBasedEdges.push_back(newEdge);
-                        ++nodeBasedEdgeCounter;
-                    } else {
-                        ++numberOfSkippedTurns;
+                if ((to_node_of_only_restriction != SPECIAL_NODEID) &&
+                    (w != to_node_of_only_restriction))
+                {
+                    // We are at an only_-restriction but not at the right turn.
+                    ++restricted_turns_counter;
+                    continue;
+                }
+
+                if (is_barrier_node)
+                {
+                    if (u != w)
+                    {
+                        ++skipped_barrier_turns_counter;
+                        continue;
                     }
                 }
+                else
+                {
+                    if ((u == w) && (m_node_based_graph->GetOutDegree(v) > 1))
+                    {
+                        ++skipped_uturns_counter;
+                        continue;
+                    }
+                }
+
+                // only add an edge if turn is not a U-turn except when it is
+                // at the end of a dead-end street
+                if (m_restriction_map->CheckIfTurnIsRestricted(u, v, w) &&
+                    (to_node_of_only_restriction == SPECIAL_NODEID) &&
+                    (w != to_node_of_only_restriction))
+                {
+                    ++restricted_turns_counter;
+                    continue;
+                }
+
+                // only add an edge if turn is not prohibited
+                const EdgeData &edge_data1 = m_node_based_graph->GetEdgeData(e1);
+                const EdgeData &edge_data2 = m_node_based_graph->GetEdgeData(e2);
+
+                BOOST_ASSERT(edge_data1.edgeBasedNodeID != edge_data2.edgeBasedNodeID);
+                BOOST_ASSERT(edge_data1.forward);
+                BOOST_ASSERT(edge_data2.forward);
+
+                // the following is the core of the loop.
+                unsigned distance = edge_data1.distance;
+                if (m_traffic_lights.find(v) != m_traffic_lights.end())
+                {
+                    distance += speed_profile.trafficSignalPenalty;
+                }
+                const double angle = GetAngleBetweenThreeFixedPointCoordinates(
+                m_node_info_list[u], m_node_info_list[v], m_node_info_list[w]);
+                const int turn_penalty = GetTurnPenalty(angle, lua_state);
+                TurnInstruction turn_instruction = AnalyzeTurn(u, v, w, angle);
+                if (turn_instruction == TurnInstruction::UTurn)
+                {
+                    distance += speed_profile.uTurnPenalty;
+                }
+                distance += turn_penalty;
+
+                const bool edge_is_compressed = m_geometry_compressor.HasEntryForID(e1);
+
+                if (edge_is_compressed)
+                {
+                    ++compressed;
+                }
+
+                original_edge_data_vector.emplace_back(
+                    (edge_is_compressed ? m_geometry_compressor.GetPositionForID(e1) : v),
+                    edge_data1.nameID,
+                    turn_instruction,
+                    edge_is_compressed);
+
+                ++original_edges_counter;
+
+                if (original_edge_data_vector.size() > 1024 * 1024 * 10)
+                {
+                    FlushVectorToStream(edge_data_file, original_edge_data_vector);
+                }
+
+                BOOST_ASSERT(SPECIAL_NODEID != edge_data1.edgeBasedNodeID);
+                BOOST_ASSERT(SPECIAL_NODEID != edge_data2.edgeBasedNodeID);
+
+                m_edge_based_edge_list.emplace_back(EdgeBasedEdge(edge_data1.edgeBasedNodeID,
+                                                                  edge_data2.edgeBasedNodeID,
+                                                                  m_edge_based_edge_list.size(),
+                                                                  distance,
+                                                                  true,
+                                                                  false));
             }
         }
         p.printIncrement();
     }
-    std::sort(edgeBasedNodes.begin(), edgeBasedNodes.end());
-    edgeBasedNodes.erase( std::unique(edgeBasedNodes.begin(), edgeBasedNodes.end()), edgeBasedNodes.end() );
-    INFO("Node-based graph contains " << nodeBasedEdgeCounter     << " edges");
-    INFO("Edge-based graph contains " << edgeBasedEdges.size()    << " edges, blowup is " << (double)edgeBasedEdges.size()/(double)nodeBasedEdgeCounter);
-    INFO("Edge-based graph skipped "  << numberOfSkippedTurns     << " turns, defined by " << numberOfTurnRestrictions << " restrictions.");
-    INFO("Generated " << edgeBasedNodes.size() << " edge based nodes");
+    FlushVectorToStream(edge_data_file, original_edge_data_vector);
+
+    edge_data_file.seekp(std::ios::beg);
+    edge_data_file.write((char *)&original_edges_counter, sizeof(unsigned));
+    edge_data_file.close();
+
+    SimpleLogger().Write() << "Generated " << m_edge_based_node_list.size() << " edge based nodes";
+    SimpleLogger().Write() << "Node-based graph contains " << node_based_edge_counter << " edges";
+    SimpleLogger().Write() << "Edge-expanded graph ...";
+    SimpleLogger().Write() << "  contains " << m_edge_based_edge_list.size() << " edges";
+    SimpleLogger().Write() << "  skips " << restricted_turns_counter << " turns, "
+                                                                        "defined by "
+                           << m_restriction_map->size() << " restrictions";
+    SimpleLogger().Write() << "  skips " << skipped_uturns_counter << " U turns";
+    SimpleLogger().Write() << "  skips " << skipped_barrier_turns_counter << " turns over barriers";
 }
 
-short EdgeBasedGraphFactory::AnalyzeTurn(const NodeID u, const NodeID v, const NodeID w) const {
-    if(u == w) {
-        return TurnInstructions.UTurn;
+int EdgeBasedGraphFactory::GetTurnPenalty(double angle, lua_State *lua_state) const
+{
+
+    if (speed_profile.has_turn_penalty_function)
+    {
+        try
+        {
+            // call lua profile to compute turn penalty
+            return luabind::call_function<int>(lua_state, "turn_function", 180. - angle);
+        }
+        catch (const luabind::error &er) { SimpleLogger().Write(logWARNING) << er.what(); }
+    }
+    return 0;
+}
+
+TurnInstruction EdgeBasedGraphFactory::AnalyzeTurn(const NodeID u,
+                                                   const NodeID v,
+                                                   const NodeID w,
+                                                   double angle)
+    const
+{
+    if (u == w)
+    {
+        return TurnInstruction::UTurn;
     }
 
-    _NodeBasedDynamicGraph::EdgeIterator edge1 = _nodeBasedGraph->FindEdge(u, v);
-    _NodeBasedDynamicGraph::EdgeIterator edge2 = _nodeBasedGraph->FindEdge(v, w);
+    const EdgeID edge1 = m_node_based_graph->FindEdge(u, v);
+    const EdgeID edge2 = m_node_based_graph->FindEdge(v, w);
 
-    _NodeBasedDynamicGraph::EdgeData & data1 = _nodeBasedGraph->GetEdgeData(edge1);
-    _NodeBasedDynamicGraph::EdgeData & data2 = _nodeBasedGraph->GetEdgeData(edge2);
+    const EdgeData &data1 = m_node_based_graph->GetEdgeData(edge1);
+    const EdgeData &data2 = m_node_based_graph->GetEdgeData(edge2);
 
-    //roundabouts need to be handled explicitely
-    if(data1.roundabout && data2.roundabout) {
-        //Is a turn possible? If yes, we stay on the roundabout!
-        if( 1 == (_nodeBasedGraph->EndEdges(v) - _nodeBasedGraph->BeginEdges(v)) ) {
-            //No turn possible.
-            return TurnInstructions.NoTurn;
-        } else {
-            return TurnInstructions.StayOnRoundAbout;
+    if (!data1.contraFlow && data2.contraFlow)
+    {
+        return TurnInstruction::EnterAgainstAllowedDirection;
+    }
+    if (data1.contraFlow && !data2.contraFlow)
+    {
+        return TurnInstruction::LeaveAgainstAllowedDirection;
+    }
+
+    // roundabouts need to be handled explicitely
+    if (data1.roundabout && data2.roundabout)
+    {
+        // Is a turn possible? If yes, we stay on the roundabout!
+        if (1 == m_node_based_graph->GetDirectedOutDegree(v))
+        {
+            // No turn possible.
+            return TurnInstruction::NoTurn;
+        }
+        return TurnInstruction::StayOnRoundAbout;
+    }
+    // Does turn start or end on roundabout?
+    if (data1.roundabout || data2.roundabout)
+    {
+        // We are entering the roundabout
+        if ((!data1.roundabout) && data2.roundabout)
+        {
+            return TurnInstruction::EnterRoundAbout;
+        }
+        // We are leaving the roundabout
+        if (data1.roundabout && (!data2.roundabout))
+        {
+            return TurnInstruction::LeaveRoundAbout;
         }
     }
-    //Does turn start or end on roundabout?
-    if(data1.roundabout || data2.roundabout) {
-        //We are entering the roundabout
-        if( (!data1.roundabout) && data2.roundabout)
-            return TurnInstructions.EnterRoundAbout;
-        //We are leaving the roundabout
-        if(data1.roundabout && (!data2.roundabout) )
-            return TurnInstructions.LeaveRoundAbout;
+
+    // If street names stay the same and if we are certain that it is not a
+    // a segment of a roundabout, we skip it.
+    if (data1.nameID == data2.nameID)
+    {
+        // TODO: Here we should also do a small graph exploration to check for
+        //      more complex situations
+        if (0 != data1.nameID)
+        {
+            return TurnInstruction::NoTurn;
+        }
+        else if (m_node_based_graph->GetOutDegree(v) <= 2)
+        {
+            return TurnInstruction::NoTurn;
+        }
     }
 
-    //If street names stay the same and if we are certain that it is not a roundabout, we skip it.
-    if( (data1.nameID == data2.nameID) && (0 != data1.nameID))
-        return TurnInstructions.NoTurn;
-    if( (data1.nameID == data2.nameID) && (0 == data1.nameID) && (_nodeBasedGraph->GetOutDegree(v) <= 2) )
-        return TurnInstructions.NoTurn;
-
-    double angle = GetAngleBetweenTwoEdges(inputNodeInfoList[u], inputNodeInfoList[v], inputNodeInfoList[w]);
-    return TurnInstructions.GetTurnDirectionOfInstruction(angle);
+    return TurnInstructionsClass::GetTurnDirectionOfInstruction(angle);
 }
 
-unsigned EdgeBasedGraphFactory::GetNumberOfNodes() const {
-    return _nodeBasedGraph->GetNumberOfEdges();
-}
-
-/* Get angle of line segment (A,C)->(C,B), atan2 magic, formerly cosine theorem*/
-template<class CoordinateT>
-double EdgeBasedGraphFactory::GetAngleBetweenTwoEdges(const CoordinateT& A, const CoordinateT& C, const CoordinateT& B) const {
-    const int v1x = A.lon - C.lon;
-    const int v1y = A.lat - C.lat;
-    const int v2x = B.lon - C.lon;
-    const int v2y = B.lat - C.lat;
-
-    double angle = (atan2((double)v2y,v2x) - atan2((double)v1y,v1x) )*180/M_PI;
-    while(angle < 0)
-        angle += 360;
-    return angle;
+unsigned EdgeBasedGraphFactory::GetNumberOfEdgeBasedNodes() const
+{
+    return m_number_of_edge_based_nodes;
 }

@@ -1,77 +1,205 @@
 /*
- open source routing machine
- Copyright (C) Dennis Luxen, others 2010
 
- This program is free software; you can redistribute it and/or modify
- it under the terms of the GNU AFFERO General Public License as published by
- the Free Software Foundation; either version 3 of the License, or
- any later version.
+Copyright (c) 2013, Project OSRM, Dennis Luxen, others
+All rights reserved.
 
- This program is distributed in the hope that it will be useful,
- but WITHOUT ANY WARRANTY; without even the implied warranty of
- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- GNU General Public License for more details.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
- You should have received a copy of the GNU Affero General Public License
- along with this program; if not, write to the Free Software
- Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- or see http://www.gnu.org/licenses/agpl.txt.
- */
+Redistributions of source code must retain the above copyright notice, this list
+of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this
+list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+*/
 
 #ifndef DESCRIPTIONFACTORY_H_
 #define DESCRIPTIONFACTORY_H_
 
-#include <vector>
-
-#include "../typedefs.h"
 #include "../Algorithms/DouglasPeucker.h"
 #include "../Algorithms/PolylineCompressor.h"
-#include "../DataStructures/ExtractorStructs.h"
-#include "../DataStructures/SearchEngine.h"
+#include "../DataStructures/PhantomNodes.h"
+#include "../DataStructures/RawRouteData.h"
 #include "../DataStructures/SegmentInformation.h"
 #include "../DataStructures/TurnInstructions.h"
+#include "../Util/SimpleLogger.h"
+#include "../typedefs.h"
+
+#include <osrm/Coordinate.h>
+
+#include <limits>
+#include <vector>
 
 /* This class is fed with all way segments in consecutive order
  *  and produces the description plus the encoded polyline */
 
-class DescriptionFactory {
-    DouglasPeucker<SegmentInformation> dp;
-    PolylineCompressor pc;
-    PhantomNode startPhantom, targetPhantom;
+class DescriptionFactory
+{
+    DouglasPeucker polyline_generalizer;
+    PolylineCompressor polyline_compressor;
+    PhantomNode start_phantom, target_phantom;
 
-    void BuildRouteSummary(const unsigned distance, const unsigned time);
-    typedef SearchEngine<ContractionCleanup::Edge::EdgeData, StaticGraph<ContractionCleanup::Edge::EdgeData> > SearchEngineT;
-public:
-    struct _RouteSummary {
-        std::string lengthString;
-        std::string durationString;
-        unsigned startName;
-        unsigned destName;
-        _RouteSummary() : lengthString("0"), durationString("0"), startName(0), destName(0) {}
-        void BuildDurationAndLengthStrings(unsigned distance, unsigned time) {
-            //compute distance/duration for route summary
-            std::ostringstream s;
-            s << 10*(round(distance/10.));
-            lengthString = s.str();
-            int travelTime = time/10 + 1;
-            s.str("");
-            s << travelTime;
-            durationString = s.str();
+    double DegreeToRadian(const double degree) const;
+    double RadianToDegree(const double degree) const;
+
+  public:
+    struct RouteSummary
+    {
+        unsigned distance;
+        EdgeWeight duration;
+        unsigned source_name_id;
+        unsigned target_name_id;
+        RouteSummary() : distance(0), duration(0), source_name_id(0), target_name_id(0) {}
+
+        void BuildDurationAndLengthStrings(const double raw_distance, const unsigned raw_duration)
+        {
+            // compute distance/duration for route summary
+            distance = round(raw_distance);
+            duration = round(raw_duration / 10.);
         }
     } summary;
 
-    //I know, declaring this public is considered bad. I'm lazy
-    std::vector <SegmentInformation> pathDescription;
+    double entireLength;
+
+    // I know, declaring this public is considered bad. I'm lazy
+    std::vector<SegmentInformation> path_description;
     DescriptionFactory();
-    virtual ~DescriptionFactory();
-    double GetAzimuth(const _Coordinate& C, const _Coordinate& B) const;
-    void AppendEncodedPolylineString(std::string &output);
-    void AppendUnencodedPolylineString(std::string &output);
-    void AppendSegment(const _Coordinate & coordinate, const _PathData & data);
-    void SetStartSegment(const PhantomNode & startPhantom);
-    void SetEndSegment(const PhantomNode & startPhantom);
-    void AppendEncodedPolylineString(std::string & output, bool isEncoded);
-    void Run(const SearchEngineT &sEngine, const unsigned zoomLevel, const unsigned duration);
+    JSON::Value AppendUnencodedPolylineString() const;
+    void AppendSegment(const FixedPointCoordinate &coordinate, const PathData &data);
+    void BuildRouteSummary(const double distance, const unsigned time);
+    void SetStartSegment(const PhantomNode &start_phantom);
+    void SetEndSegment(const PhantomNode &start_phantom);
+    JSON::Value AppendEncodedPolylineString(const bool return_encoded);
+
+    template <class DataFacadeT> void Run(const DataFacadeT *facade, const unsigned zoomLevel)
+    {
+        if (path_description.empty())
+        {
+            return;
+        }
+
+        /** starts at index 1 */
+        path_description[0].length = 0;
+        for (unsigned i = 1; i < path_description.size(); ++i)
+        {
+            // move down names by one, q&d hack
+            path_description[i - 1].name_id = path_description[i].name_id;
+            path_description[i].length = FixedPointCoordinate::ApproximateEuclideanDistance(
+                path_description[i - 1].location, path_description[i].location);
+        }
+
+        /*Simplify turn instructions
+        Input :
+        10. Turn left on B 36 for 20 km
+        11. Continue on B 35; B 36 for 2 km
+        12. Continue on B 36 for 13 km
+
+        becomes:
+        10. Turn left on B 36 for 35 km
+        */
+        // TODO: rework to check only end and start of string.
+        //      stl string is way to expensive
+
+        //    unsigned lastTurn = 0;
+        //    for(unsigned i = 1; i < path_description.size(); ++i) {
+        //        string1 = sEngine.GetEscapedNameForNameID(path_description[i].name_id);
+        //        if(TurnInstruction::GoStraight == path_description[i].turn_instruction) {
+        //            if(std::string::npos != string0.find(string1+";")
+        //                  || std::string::npos != string0.find(";"+string1)
+        //                  || std::string::npos != string0.find(string1+" ;")
+        //                    || std::string::npos != string0.find("; "+string1)
+        //                    ){
+        //                SimpleLogger().Write() << "->next correct: " << string0 << " contains " <<
+        //                string1;
+        //                for(; lastTurn != i; ++lastTurn)
+        //                    path_description[lastTurn].name_id = path_description[i].name_id;
+        //                path_description[i].turn_instruction = TurnInstruction::NoTurn;
+        //            } else if(std::string::npos != string1.find(string0+";")
+        //                  || std::string::npos != string1.find(";"+string0)
+        //                    || std::string::npos != string1.find(string0+" ;")
+        //                    || std::string::npos != string1.find("; "+string0)
+        //                    ){
+        //                SimpleLogger().Write() << "->prev correct: " << string1 << " contains " <<
+        //                string0;
+        //                path_description[i].name_id = path_description[i-1].name_id;
+        //                path_description[i].turn_instruction = TurnInstruction::NoTurn;
+        //            }
+        //        }
+        //        if (TurnInstruction::NoTurn != path_description[i].turn_instruction) {
+        //            lastTurn = i;
+        //        }
+        //        string0 = string1;
+        //    }
+
+        double segment_length = 0.;
+        unsigned segment_duration = 0;
+        unsigned segment_start_index = 0;
+
+        for (unsigned i = 1; i < path_description.size(); ++i)
+        {
+            entireLength += path_description[i].length;
+            segment_length += path_description[i].length;
+            segment_duration += path_description[i].duration;
+            path_description[segment_start_index].length = segment_length;
+            path_description[segment_start_index].duration = segment_duration;
+
+            if (TurnInstruction::NoTurn != path_description[i].turn_instruction)
+            {
+                BOOST_ASSERT(path_description[i].necessary);
+                segment_length = 0;
+                segment_duration = 0;
+                segment_start_index = i;
+            }
+        }
+
+        // Post-processing to remove empty or nearly empty path segments
+        if (std::numeric_limits<double>::epsilon() > path_description.back().length)
+        {
+            if (path_description.size() > 2)
+            {
+                path_description.pop_back();
+                path_description.back().necessary = true;
+                path_description.back().turn_instruction = TurnInstruction::NoTurn;
+                target_phantom.name_id = (path_description.end() - 2)->name_id;
+            }
+        }
+        if (std::numeric_limits<double>::epsilon() > path_description.front().length)
+        {
+            if (path_description.size() > 2)
+            {
+                path_description.erase(path_description.begin());
+                path_description.front().turn_instruction = TurnInstruction::HeadOn;
+                path_description.front().necessary = true;
+                start_phantom.name_id = path_description.front().name_id;
+            }
+        }
+
+        // Generalize poly line
+        polyline_generalizer.Run(path_description, zoomLevel);
+
+        // fix what needs to be fixed else
+        for (unsigned i = 0; i < path_description.size() - 1 && path_description.size() >= 2; ++i)
+        {
+            if (path_description[i].necessary)
+            {
+                const double angle = path_description[i+1].location.GetBearing(path_description[i].location);
+                path_description[i].bearing = angle * 10;
+            }
+        }
+        return;
+    }
 };
 
 #endif /* DESCRIPTIONFACTORY_H_ */

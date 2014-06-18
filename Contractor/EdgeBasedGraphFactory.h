@@ -1,132 +1,128 @@
 /*
- open source routing machine
- Copyright (C) Dennis Luxen, others 2010
 
- This program is free software; you can redistribute it and/or modify
- it under the terms of the GNU AFFERO General Public License as published by
- the Free Software Foundation; either version 3 of the License, or
- any later version.
+Copyright (c) 2013, Project OSRM, Dennis Luxen, others
+All rights reserved.
 
- This program is distributed in the hope that it will be useful,
- but WITHOUT ANY WARRANTY; without even the implied warranty of
- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- GNU General Public License for more details.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
- You should have received a copy of the GNU Affero General Public License
- along with this program; if not, write to the Free Software
- Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- or see http://www.gnu.org/licenses/agpl.txt.
- */
+Redistributions of source code must retain the above copyright notice, this list
+of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this
+list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
 
-/*
- * This class constructs the edge base representation of a graph from a given node based edge list
- */
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+*/
+
+//  This class constructs the edge-expanded routing graph
 
 #ifndef EDGEBASEDGRAPHFACTORY_H_
 #define EDGEBASEDGRAPHFACTORY_H_
 
-#include <boost/shared_ptr.hpp>
-#include <boost/property_tree/ptree.hpp>
-#include <boost/property_tree/ini_parser.hpp>
+#include "../typedefs.h"
+#include "../DataStructures/DeallocatingVector.h"
+#include "../DataStructures/DynamicGraph.h"
+#include "../DataStructures/EdgeBasedNode.h"
+#include "../DataStructures/OriginalEdgeData.h"
+#include "../DataStructures/QueryNode.h"
+#include "../DataStructures/TurnInstructions.h"
+#include "../DataStructures/Restriction.h"
+#include "../DataStructures/NodeBasedGraph.h"
+#include "../DataStructures/RestrictionMap.h"
+#include "GeometryCompressor.h"
 
+#include <algorithm>
+#include <iosfwd>
+#include <memory>
+#include <queue>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
-#include <cstdlib>
+struct lua_State;
 
-#include "../typedefs.h"
-#include "../DataStructures/DynamicGraph.h"
-#include "../DataStructures/ExtractorStructs.h"
-#include "../DataStructures/HashTable.h"
-#include "../DataStructures/ImportEdge.h"
-#include "../DataStructures/Percent.h"
-#include "../DataStructures/TurnInstructions.h"
-#include "../Util/BaseConfiguration.h"
+class EdgeBasedGraphFactory
+{
+  public:
+    EdgeBasedGraphFactory() = delete;
+    EdgeBasedGraphFactory(const EdgeBasedGraphFactory &) = delete;
 
-//#include "../Util/SRTMLookup.h"
+    struct SpeedProfileProperties;
 
-class EdgeBasedGraphFactory {
-private:
-    struct _NodeBasedEdgeData {
-        int distance;
-        unsigned edgeBasedNodeID;
-        unsigned nameID:31;
-        bool shortcut:1;
-        bool forward:1;
-        bool backward:1;
-        bool roundabout:1;
-        bool ignoreInGrid:1;
-        short type;
-    };
+    explicit EdgeBasedGraphFactory(const std::shared_ptr<NodeBasedDynamicGraph> &node_based_graph,
+                                   std::unique_ptr<RestrictionMap> restricion_map,
+                                   std::vector<NodeID> &barrier_node_list,
+                                   std::vector<NodeID> &traffic_light_node_list,
+                                   std::vector<NodeInfo> &m_node_info_list,
+                                   SpeedProfileProperties &speed_profile);
 
-    struct _EdgeBasedEdgeData {
-        int distance;
-        unsigned via;
-        unsigned nameID;
-        bool forward;
-        bool backward;
-        short turnInstruction;
-    };
+    void Run(const std::string &original_edge_data_filename,
+             const std::string &geometry_filename,
+             lua_State *lua_state);
 
-    typedef DynamicGraph< _NodeBasedEdgeData > _NodeBasedDynamicGraph;
-    typedef _NodeBasedDynamicGraph::InputEdge _NodeBasedEdge;
+    void GetEdgeBasedEdges(DeallocatingVector<EdgeBasedEdge> &edges);
 
-public:
-    struct EdgeBasedNode {
-        bool operator<(const EdgeBasedNode & other) const {
-            return other.id < id;
+    void GetEdgeBasedNodes(std::vector<EdgeBasedNode> &nodes);
+
+    TurnInstruction AnalyzeTurn(const NodeID u, const NodeID v, const NodeID w, double angle) const;
+
+    int GetTurnPenalty(double angle, lua_State *lua_state) const;
+
+    unsigned GetNumberOfEdgeBasedNodes() const;
+
+    struct SpeedProfileProperties
+    {
+        SpeedProfileProperties()
+            : trafficSignalPenalty(0), uTurnPenalty(0), has_turn_penalty_function(false)
+        {
         }
-        bool operator==(const EdgeBasedNode & other) const {
-            return id == other.id;
-        }
-        int lat1;
-        int lat2;
-        int lon1;
-        int lon2;
-        NodeID id;
-        NodeID nameID;
-        unsigned weight:31;
-        bool ignoreInGrid:1;
-    };
 
-private:
-    boost::shared_ptr<_NodeBasedDynamicGraph>   _nodeBasedGraph;
-    boost::unordered_map<NodeID, bool>          _barrierNodes;
-    boost::unordered_map<NodeID, bool>          _trafficLights;
+        int trafficSignalPenalty;
+        int uTurnPenalty;
+        bool has_turn_penalty_function;
+    } speed_profile;
 
-    typedef std::pair<NodeID, NodeID> RestrictionSource;
-    typedef std::pair<NodeID, bool>   RestrictionTarget;
-    typedef std::vector<RestrictionTarget> EmanatingRestrictionsVector;
-    typedef boost::unordered_map<RestrictionSource, unsigned > RestrictionMap;
-    std::vector<EmanatingRestrictionsVector> _restrictionBucketVector;
-    RestrictionMap _restrictionMap;
+  private:
+    typedef NodeBasedDynamicGraph::EdgeData EdgeData;
 
-    int trafficSignalPenalty;
+    unsigned m_number_of_edge_based_nodes;
 
-    std::vector<EdgeBasedEdge> edgeBasedEdges;
-    std::vector<EdgeBasedNode> edgeBasedNodes;
-    std::vector<NodeInfo>       inputNodeInfoList;
+    std::vector<NodeInfo> m_node_info_list;
+    std::vector<EdgeBasedNode> m_edge_based_node_list;
+    DeallocatingVector<EdgeBasedEdge> m_edge_based_edge_list;
 
-    NodeID CheckForEmanatingIsOnlyTurn(const NodeID u, const NodeID v) const;
-    bool CheckIfTurnIsRestricted(const NodeID u, const NodeID v, const NodeID w) const;
-    void InsertEdgeBasedNode(
-            _NodeBasedDynamicGraph::EdgeIterator e1,
-            _NodeBasedDynamicGraph::NodeIterator u,
-            _NodeBasedDynamicGraph::NodeIterator v);
-    template<class CoordinateT>
-    double GetAngleBetweenTwoEdges(const CoordinateT& A, const CoordinateT& C, const CoordinateT& B) const;
-//    SRTMLookup srtmLookup;
-    unsigned numberOfTurnRestrictions;
+    std::shared_ptr<NodeBasedDynamicGraph> m_node_based_graph;
+    std::unordered_set<NodeID> m_barrier_nodes;
+    std::unordered_set<NodeID> m_traffic_lights;
 
-public:
-    template< class InputEdgeT >
-    explicit EdgeBasedGraphFactory(int nodes, std::vector<InputEdgeT> & inputEdges, std::vector<NodeID> & _bollardNodes, std::vector<NodeID> & trafficLights, std::vector<_Restriction> & inputRestrictions, std::vector<NodeInfo> & nI, boost::property_tree::ptree speedProfile, std::string & srtm);
+    std::unique_ptr<RestrictionMap> m_restriction_map;
 
-    void Run();
-    template< class ImportEdgeT >
-    void GetEdgeBasedEdges( std::vector< ImportEdgeT >& edges );
-    void GetEdgeBasedNodes( std::vector< EdgeBasedNode> & nodes);
-    short AnalyzeTurn(const NodeID u, const NodeID v, const NodeID w) const;
-    unsigned GetNumberOfNodes() const;
+    GeometryCompressor m_geometry_compressor;
+
+    void CompressGeometry();
+    void RenumberEdges();
+    void GenerateEdgeExpandedNodes();
+    void GenerateEdgeExpandedEdges(const std::string &original_edge_data_filename,
+                                   lua_State *lua_state);
+
+    void InsertEdgeBasedNode(NodeID u, NodeID v, EdgeID e1, bool belongsToTinyComponent);
+
+    void FlushVectorToStream(std::ofstream &edge_data_file,
+                             std::vector<OriginalEdgeData> &original_edge_data_vector) const;
+
+    unsigned max_id;
 };
 
 #endif /* EDGEBASEDGRAPHFACTORY_H_ */

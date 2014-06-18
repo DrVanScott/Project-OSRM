@@ -33,11 +33,11 @@ ehthumbs.db
 Icon?
 Thumbs.db
 
-# SCons related files #
+# build related files #
 #######################
-SconsBuilder*
-.scon*
-.build
+/build/
+/Util/UUID.cpp
+/Util/GitDescription.cpp
 
 # Eclipse related files #
 #########################
@@ -54,28 +54,39 @@ stxxl.errlog
 
 # compiled protobuffers #
 #########################
-DataStructures/pbf-proto/*.pb.h
-DataStructures/pbf-proto/*.pb.cc
+/DataStructures/pbf-proto/*.pb.h
+/DataStructures/pbf-proto/*.pb.cc
 
 # External Libs #
 #################
-lib/
-win/lib
+/lib/
+/win/lib
 
 # Visual Studio Temp + build Files #
 ####################################
-win/*.user
-win/*.ncb
-win/*.suo
-win/Debug/
-win/Release/
-win/bin/
-win/bin-debug/
+/win/*.user
+/win/*.ncb
+/win/*.suo
+/win/Debug/
+/win/Release/
+/win/bin/
+/win/bin-debug/
 /osrm-extract
+/osrm-io-benchmark
+/osrm-components
 /osrm-routed
+/osrm-datastore
 /osrm-prepare
+/osrm-unlock-all
+/osrm-cli
 /nohup.out
 
 # Sandbox folder #
 ###################
-sandbox/
+/sandbox/
+
+/test/profile.lua
+
+# Deprecated config file #
+##########################
+/server.ini

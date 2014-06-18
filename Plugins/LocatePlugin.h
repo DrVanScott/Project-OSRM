@@ -1,107 +1,79 @@
 /*
-    open source routing machine
-    Copyright (C) Dennis Luxen, 2010
 
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU AFFERO General Public License as published by
-the Free Software Foundation; either version 3 of the License, or
-any later version.
+Copyright (c) 2013, Project OSRM, Dennis Luxen, others
+All rights reserved.
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
-You should have received a copy of the GNU Affero General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-or see http://www.gnu.org/licenses/agpl.txt.
- */
+Redistributions of source code must retain the above copyright notice, this list
+of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this
+list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
 
-#ifndef LOCATEPLUGIN_H_
-#define LOCATEPLUGIN_H_
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include <fstream>
+*/
 
-#include "ObjectForPluginStruct.h"
+#ifndef LOCATE_PLUGIN_H
+#define LOCATE_PLUGIN_H
+
 #include "BasePlugin.h"
-#include "RouteParameters.h"
+#include "../DataStructures/JSONContainer.h"
 #include "../Util/StringUtil.h"
-#include "../DataStructures/NodeInformationHelpDesk.h"
 
-/*
- * This Plugin locates the nearest node in the road network for a given coordinate.
- */
-class LocatePlugin : public BasePlugin {
-public:
-    LocatePlugin(ObjectsForQueryStruct * objects) {
-        nodeHelpDesk = objects->nodeHelpDesk;
+#include <string>
+
+// locates the nearest node in the road network for a given coordinate.
+template <class DataFacadeT> class LocatePlugin : public BasePlugin
+{
+  public:
+    explicit LocatePlugin(DataFacadeT *facade) : descriptor_string("locate"), facade(facade) {}
+    const std::string GetDescriptor() const { return descriptor_string; }
+
+    void HandleRequest(const RouteParameters &route_parameters, http::Reply &reply)
+    {
+        // check number of parameters
+        if (route_parameters.coordinates.empty() ||
+            !route_parameters.coordinates.front().isValid())
+        {
+            reply = http::Reply::StockReply(http::Reply::badRequest);
+            return;
+        }
+
+        JSON::Object json_result;
+        FixedPointCoordinate result;
+        if (!facade->LocateClosestEndPointForCoordinate(route_parameters.coordinates.front(),
+                                                        result))
+        {
+            json_result.values["status"] = 207;
+        }
+        else
+        {
+            reply.status = http::Reply::ok;
+            json_result.values["status"] = 0;
+            JSON::Array json_coordinate;
+            json_coordinate.values.push_back(result.lat/COORDINATE_PRECISION);
+            json_coordinate.values.push_back(result.lon/COORDINATE_PRECISION);
+            json_result.values["mapped_coordinate"] = json_coordinate;
+        }
+
+        JSON::render(reply.content, json_result);
     }
-	std::string GetDescriptor() const { return std::string("locate"); }
-	std::string GetVersionString() const { return std::string("0.3 (DL)"); }
-	void HandleRequest(const RouteParameters & routeParameters, http::Reply& reply) {
-		//check number of parameters
-		if(routeParameters.parameters.size() != 2) {
-			reply = http::Reply::stockReply(http::Reply::badRequest);
-			return;
-		}
 
-		int lat = static_cast<int>(100000.*atof(routeParameters.parameters[0].c_str()));
-		int lon = static_cast<int>(100000.*atof(routeParameters.parameters[1].c_str()));
-
-		if(lat>90*100000 || lat <-90*100000 || lon>180*100000 || lon <-180*100000) {
-		    reply = http::Reply::stockReply(http::Reply::badRequest);
-		    return;
-		}
-		//query to helpdesk
-		_Coordinate result;
-		nodeHelpDesk->FindNearestNodeCoordForLatLon(_Coordinate(lat, lon), result);
-
-		std::string tmp;
-        std::string JSONParameter;
-        //json
-
-        JSONParameter = routeParameters.options.Find("jsonp");
-        if("" != JSONParameter) {
-            reply.content += JSONParameter;
-            reply.content += "(";
-        }
-
-		//Write to stream
-        reply.status = http::Reply::ok;
-        reply.content += ("{");
-        reply.content += ("\"version\":0.3,");
-        reply.content += ("\"status\":0,");
-        reply.content += ("\"result\":");
-        convertInternalLatLonToString(result.lat, tmp);
-        reply.content += "[";
-        reply.content += tmp;
-        convertInternalLatLonToString(result.lon, tmp);
-        reply.content += ", ";
-        reply.content += tmp;
-        reply.content += "]";
-        reply.content += ",\"transactionId\": \"OSRM Routing Engine JSON Locate (v0.3)\"";
-        reply.content += ("}");
-        reply.headers.resize(3);
-        if("" != JSONParameter) {
-            reply.content += ")";
-            reply.headers[1].name = "Content-Type";
-            reply.headers[1].value = "text/javascript";
-            reply.headers[2].name = "Content-Disposition";
-            reply.headers[2].value = "attachment; filename=\"location.js\"";
-        } else {
-            reply.headers[1].name = "Content-Type";
-            reply.headers[1].value = "application/x-javascript";
-            reply.headers[2].name = "Content-Disposition";
-            reply.headers[2].value = "attachment; filename=\"location.json\"";
-        }
-        reply.headers[0].name = "Content-Length";
-        intToString(reply.content.size(), tmp);
-        reply.headers[0].value = tmp;
-		return;
-	}
-private:
-	NodeInformationHelpDesk * nodeHelpDesk;
+  private:
+    std::string descriptor_string;
+    DataFacadeT *facade;
 };
 
-#endif /* LOCATEPLUGIN_H_ */
+#endif /* LOCATE_PLUGIN_H */

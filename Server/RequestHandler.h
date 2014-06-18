@@ -1,132 +1,59 @@
 /*
-    open source routing machine
-    Copyright (C) Dennis Luxen, 2010
 
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU AFFERO General Public License as published by
-the Free Software Foundation; either version 3 of the License, or
-any later version.
+Copyright (c) 2013, Project OSRM, Dennis Luxen, others
+All rights reserved.
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
-You should have received a copy of the GNU Affero General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-or see http://www.gnu.org/licenses/agpl.txt.
- */
+Redistributions of source code must retain the above copyright notice, this list
+of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this
+list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+*/
 
 #ifndef REQUEST_HANDLER_H
 #define REQUEST_HANDLER_H
 
-#include <algorithm>
-#include <cctype> // std::tolower
 #include <string>
-#include <iostream>
-#include <boost/lexical_cast.hpp>
-#include <boost/noncopyable.hpp>
 
-#include "BasicDatastructures.h"
-#include "../DataStructures/HashTable.h"
-#include "../Plugins/BasePlugin.h"
-#include "../Plugins/RouteParameters.h"
-#include "../typedefs.h"
+template <typename Iterator, class HandlerT> struct APIGrammar;
+struct RouteParameters;
+class OSRM;
 
-namespace http {
+namespace http
+{
+class Reply;
+struct Request;
+}
 
-class RequestHandler : private boost::noncopyable {
-public:
-	explicit RequestHandler() : _pluginCount(0) { }
+class RequestHandler
+{
 
-	~RequestHandler() {
+  public:
+    typedef APIGrammar<std::string::iterator, RouteParameters> APIGrammarParser;
 
-	    for(unsigned i = 0; i < _pluginVector.size(); i++) {
-	        BasePlugin * tempPointer = _pluginVector[i];
-	        DELETE( tempPointer );
-	    }
-	}
+    RequestHandler();
+    RequestHandler(const RequestHandler &) = delete;
 
-	void handle_request(const Request& req, Reply& rep){
-		//parse command
-        std::string request(req.uri);
-//	    time_t ltime;
-//	    struct tm *Tm;
-//
-//	    ltime=time(NULL);
-//	    Tm=localtime(&ltime);
-//
-//	    INFO( Tm->tm_mday << "-" << (Tm->tm_mon < 10 ? "0" : "" )  << Tm->tm_mon << "-" << 1900+Tm->tm_year << " " << Tm->tm_hour << ":" << Tm->tm_min << ":" << Tm->tm_sec << " " <<
-//	            req.endpoint.to_string() << " " << request );
-		std::string command;
-		std::size_t firstAmpPosition = request.find_first_of("?");
-		command = request.substr(1,firstAmpPosition-1);
-//		DEBUG("[debug] looking for handler for command: " << command);
-		try {
-			if(pluginMap.Holds(command)) {
+    void handle_request(const http::Request &req, http::Reply &rep);
+    void RegisterRoutingMachine(OSRM *osrm);
 
-				RouteParameters routeParameters;
-				std::stringstream ss(( firstAmpPosition == std::string::npos ? "" : request.substr(firstAmpPosition+1) ));
-				std::string item;
-				while(std::getline(ss, item, '&')) {
-				    size_t found = item.find('=');
-				    if(found == std::string::npos) {
-				        routeParameters.parameters.push_back(item);
-				    } else {
-				        std::string p = item.substr(0, found);
-				        std::transform(p.begin(), p.end(), p.begin(), (int(*)(int)) std::tolower);
-				        std::string o = item.substr(found+1);
-				        if("jsonp" != p)
-				            std::transform(o.begin(), o.end(), o.begin(), (int(*)(int)) std::tolower);
-				        if("via" == p ) {
-				            if(25 >= routeParameters.viaPoints.size()) {
-				                routeParameters.viaPoints.push_back(o);
-				            }
-				        } else if("hint" == p) {
-				            routeParameters.hints.resize(routeParameters.viaPoints.size(), 0);
-				            if(routeParameters.hints.size()) {
-				                unsigned hint = 0;
-				                try {
-				                    hint = 10*boost::lexical_cast<int>(o);
-				                } catch(boost::bad_lexical_cast &) { /* do nothing since hint is initialized to 0 */}
-				                routeParameters.hints.back() = hint;
-				            }
-				        } else {
-				            routeParameters.options.Set(p, o);
-				        }
-				    }
-				}
-
-//				std::cout << "[debug] found handler for '" << command << "' at version: " << pluginMap.Find(command)->GetVersionString() << std::endl;
-//				std::cout << "[debug] remaining parameters: " << parameters.size() << std::endl;
-				rep.status = Reply::ok;
-				_pluginVector[pluginMap.Find(command)]->HandleRequest(routeParameters, rep );
-
-//				std::cout << rep.content << std::endl;
-			} else {
-				rep = Reply::stockReply(Reply::badRequest);
-			}
-			return;
-		} catch(std::exception& e) {
-			rep = Reply::stockReply(Reply::internalServerError);
-			std::cerr << "[server error] code: " << e.what() << ", uri: " << req.uri << std::endl;
-			return;
-		}
-	};
-
-	void RegisterPlugin(BasePlugin * plugin) {
-		std::cout << "[handler] registering plugin " << plugin->GetDescriptor() << std::endl;
-		pluginMap.Add(plugin->GetDescriptor(), _pluginCount);
-		_pluginVector.push_back(plugin);
-		_pluginCount++;
-	}
-
-private:
-	HashTable<std::string, unsigned> pluginMap;
-	std::vector<BasePlugin *> _pluginVector;
-	unsigned _pluginCount;
+  private:
+    OSRM *routing_machine;
 };
-} // namespace http
 
 #endif // REQUEST_HANDLER_H

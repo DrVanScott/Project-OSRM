@@ -1,257 +1,182 @@
 /*
-    open source routing machine
-    Copyright (C) Dennis Luxen, others 2010
 
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU AFFERO General Public License as published by
-the Free Software Foundation; either version 3 of the License, or
-any later version.
+Copyright (c) 2013, Project OSRM, Dennis Luxen, others
+All rights reserved.
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
-You should have received a copy of the GNU Affero General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-or see http://www.gnu.org/licenses/agpl.txt.
- */
+Redistributions of source code must retain the above copyright notice, this list
+of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this
+list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
 
-#ifndef VIAROUTEPLUGIN_H_
-#define VIAROUTEPLUGIN_H_
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include <cstdlib>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <vector>
+*/
 
-#include "ObjectForPluginStruct.h"
+#ifndef VIA_ROUTE_PLUGIN_H
+#define VIA_ROUTE_PLUGIN_H
 
 #include "BasePlugin.h"
-#include "RouteParameters.h"
+
+#include "../Algorithms/ObjectToBase64.h"
+
+#include "../DataStructures/QueryEdge.h"
+#include "../DataStructures/SearchEngine.h"
 #include "../Descriptors/BaseDescriptor.h"
 #include "../Descriptors/GPXDescriptor.h"
 #include "../Descriptors/JSONDescriptor.h"
-
-#include "../DataStructures/HashTable.h"
-#include "../DataStructures/StaticGraph.h"
-#include "../DataStructures/SearchEngine.h"
-
+#include "../Util/SimpleLogger.h"
 #include "../Util/StringUtil.h"
+#include "../Util/TimingUtil.h"
 
-class ViaRoutePlugin : public BasePlugin {
-private:
-    NodeInformationHelpDesk * nodeHelpDesk;
-    std::vector<std::string> * names;
-    StaticGraph<EdgeData> * graph;
-    HashTable<std::string, unsigned> descriptorTable;
-    std::string pluginDescriptorString;
+#include <cstdlib>
 
-    SearchEngine<EdgeData, StaticGraph<EdgeData> > * searchEngine;
-public:
+#include <algorithm>
+#include <memory>
+#include <unordered_map>
+#include <string>
+#include <vector>
 
-    ViaRoutePlugin(ObjectsForQueryStruct * objects, std::string psd = "viaroute") : pluginDescriptorString(psd) {
-        nodeHelpDesk = objects->nodeHelpDesk;
-        graph = objects->graph;
-        names = objects->names;
+template <class DataFacadeT> class ViaRoutePlugin : public BasePlugin
+{
+  private:
+    std::unordered_map<std::string, unsigned> descriptor_table;
+    std::shared_ptr<SearchEngine<DataFacadeT>> search_engine_ptr;
 
-        searchEngine = new SearchEngine<EdgeData, StaticGraph<EdgeData> >(graph, nodeHelpDesk, names);
+  public:
+    explicit ViaRoutePlugin(DataFacadeT *facade) : descriptor_string("viaroute"), facade(facade)
+    {
+        search_engine_ptr = std::make_shared<SearchEngine<DataFacadeT>>(facade);
 
-        descriptorTable.Set("", 0); //default descriptor
-        descriptorTable.Set("json", 0);
-        descriptorTable.Set("gpx", 1);
+        descriptor_table.emplace("json", 0);
+        descriptor_table.emplace("gpx", 1);
+        // descriptor_table.emplace("geojson", 2);
     }
 
-    virtual ~ViaRoutePlugin() {
-        DELETE( searchEngine );
-    }
+    virtual ~ViaRoutePlugin() {}
 
-    std::string GetDescriptor() const { return pluginDescriptorString; }
-    std::string GetVersionString() const { return std::string("0.3 (DL)"); }
-    void HandleRequest(const RouteParameters & routeParameters, http::Reply& reply) {
-        //check number of parameters
-        if(0 == routeParameters.options["start"].size() || 0 == routeParameters.options["dest"].size() ) {
-            reply = http::Reply::stockReply(http::Reply::badRequest);
+    const std::string GetDescriptor() const { return descriptor_string; }
+
+    void HandleRequest(const RouteParameters &route_parameters, http::Reply &reply)
+    {
+        // check number of parameters
+        if (2 > route_parameters.coordinates.size() ||
+            std::any_of(begin(route_parameters.coordinates),
+                        end(route_parameters.coordinates),
+                        [&](FixedPointCoordinate coordinate)
+                        { return !coordinate.isValid(); }))
+        {
+            reply = http::Reply::StockReply(http::Reply::badRequest);
             return;
         }
 
-        //Get start and end Coordinate
-        std::string start = routeParameters.options["start"];
-        std::string dest = routeParameters.options["dest"];
-
-        std::vector<std::string> textCoord = split (start, ',');
-
-        int lat1 = static_cast<int>(100000.*atof(textCoord[0].c_str()));
-        int lon1 = static_cast<int>(100000.*atof(textCoord[1].c_str()));
-
-        textCoord = split (dest, ',');
-
-        int lat2 = static_cast<int>(100000.*atof(textCoord[0].c_str()));
-        int lon2 = static_cast<int>(100000.*atof(textCoord[1].c_str()));
-
-        _Coordinate startCoord(lat1, lon1);
-        _Coordinate targetCoord(lat2, lon2);
-        RawRouteData rawRoute;
-        rawRoute.checkSum = nodeHelpDesk->GetCheckSum();
-        if(false == checkCoord(startCoord) || false == checkCoord(targetCoord)) {
-            reply = http::Reply::stockReply(http::Reply::badRequest);
-            return;
+        RawRouteData raw_route;
+        raw_route.check_sum = facade->GetCheckSum();
+        for (const FixedPointCoordinate &coordinate : route_parameters.coordinates)
+        {
+            raw_route.raw_via_node_coordinates.emplace_back(coordinate);
         }
-        rawRoute.rawViaNodeCoordinates.push_back(startCoord);
 
-        for(unsigned i = 0; i < routeParameters.viaPoints.size(); ++i) {
-            textCoord = split (routeParameters.viaPoints[i], ',');
-            if(textCoord.size() != 2) {
-                reply = http::Reply::stockReply(http::Reply::badRequest);
-                return;
+        std::vector<PhantomNode> phantom_node_vector(raw_route.raw_via_node_coordinates.size());
+        const bool checksum_OK = (route_parameters.check_sum == raw_route.check_sum);
+
+        for (unsigned i = 0; i < raw_route.raw_via_node_coordinates.size(); ++i)
+        {
+            if (checksum_OK && i < route_parameters.hints.size() &&
+                !route_parameters.hints[i].empty())
+            {
+                DecodeObjectFromBase64(route_parameters.hints[i], phantom_node_vector[i]);
+                if (phantom_node_vector[i].isValid(facade->GetNumberOfNodes()))
+                {
+                    continue;
+                }
             }
-            int vialat = static_cast<int>(100000.*atof(textCoord[0].c_str()));
-            int vialon = static_cast<int>(100000.*atof(textCoord[1].c_str()));
-//            INFO("[debug] via" << i << ": " << vialat << "," << vialon);
-            _Coordinate viaCoord(vialat, vialon);
-            if(false == checkCoord(viaCoord)) {
-                reply = http::Reply::stockReply(http::Reply::badRequest);
-                return;
-            }
-            rawRoute.rawViaNodeCoordinates.push_back(viaCoord);
+            facade->FindPhantomNodeForCoordinate(raw_route.raw_via_node_coordinates[i],
+                                                 phantom_node_vector[i],
+                                                 route_parameters.zoom_level);
         }
-        rawRoute.rawViaNodeCoordinates.push_back(targetCoord);
-        vector<PhantomNode> phantomNodeVector(rawRoute.rawViaNodeCoordinates.size());
-        for(unsigned i = 0; i < rawRoute.rawViaNodeCoordinates.size(); ++i) {
-            searchEngine->FindPhantomNodeForCoordinate( rawRoute.rawViaNodeCoordinates[i], phantomNodeVector[i]);
-//            INFO("found coord [" << i << "|" << rawRoute.rawViaNodeCoordinates.size());
+
+        PhantomNodes current_phantom_node_pair;
+        for (unsigned i = 0; i < phantom_node_vector.size() - 1; ++i)
+        {
+            current_phantom_node_pair.source_phantom = phantom_node_vector[i];
+            current_phantom_node_pair.target_phantom = phantom_node_vector[i + 1];
+            raw_route.segment_end_coordinates.emplace_back(current_phantom_node_pair);
         }
-        unsigned distance = 0;
-        //single route or via point routing
-        if(2 == rawRoute.rawViaNodeCoordinates.size()) {
-            PhantomNodes segmentPhantomNodes;
-            segmentPhantomNodes.startPhantom = phantomNodeVector[0];
-            segmentPhantomNodes.targetPhantom = phantomNodeVector[1];
-            distance = searchEngine->ComputeRoute(segmentPhantomNodes, rawRoute.computedRouted);
-            rawRoute.segmentEndCoordinates.push_back(segmentPhantomNodes);
-        } else {
-            //Getting the shortest via path is a dynamic programming problem and is solved as such.
-            for(unsigned i = 0; i < phantomNodeVector.size()-1; ++i) {
-                 PhantomNodes segmentPhantomNodes;
-                 segmentPhantomNodes.startPhantom = phantomNodeVector[i];
-                 segmentPhantomNodes.targetPhantom = phantomNodeVector[i+1];
-                 rawRoute.segmentEndCoordinates.push_back(segmentPhantomNodes);
-            }
-            distance = searchEngine->ComputeViaRoute(rawRoute.segmentEndCoordinates, rawRoute.computedRouted);
+
+        const bool is_alternate_requested = route_parameters.alternate_route;
+        const bool is_only_one_segment = (1 == raw_route.segment_end_coordinates.size());
+        TIMER_START(routing);
+        if (is_alternate_requested && is_only_one_segment)
+        {
+            search_engine_ptr->alternative_path(raw_route.segment_end_coordinates.front(),
+                                                raw_route);
         }
-        if(INT_MAX == distance ) {
-            DEBUG( "Error occurred, single path not found" );
+        else
+        {
+            search_engine_ptr->shortest_path(raw_route.segment_end_coordinates, raw_route);
+        }
+        TIMER_STOP(routing);
+        SimpleLogger().Write() << "routing took " << TIMER_MSEC(routing) << "ms";
+
+        if (INVALID_EDGE_WEIGHT == raw_route.shortest_path_length)
+        {
+            SimpleLogger().Write(logDEBUG) << "Error occurred, single path not found";
         }
         reply.status = http::Reply::ok;
 
-        BaseDescriptor<SearchEngine<EdgeData, StaticGraph<EdgeData> > > * desc;
-        std::string JSONParameter = routeParameters.options.Find("jsonp");
-        if("" != JSONParameter) {
-            reply.content += JSONParameter;
-            reply.content += "(";
-        }
+        DescriptorConfig descriptor_config;
 
-        _DescriptorConfig descriptorConfig;
-        unsigned descriptorType = descriptorTable[routeParameters.options.Find("output")];
-        unsigned short zoom = 18;
-        if(routeParameters.options.Find("z") != ""){
-            zoom = atoi(routeParameters.options.Find("z").c_str());
-            if(18 < zoom)
-                zoom = 18;
-        }
-        descriptorConfig.z = zoom;
-        if(routeParameters.options.Find("instructions") == "false") {
-            descriptorConfig.instructions = false;
-        }
-        if(routeParameters.options.Find("geometry") == "false" ) {
-            descriptorConfig.geometry = false;
-        }
-        if("cmp" == routeParameters.options.Find("geomformat") || "cmp6" == routeParameters.options.Find("geomformat")  ) {
-            descriptorConfig.encodeGeometry = true;
-        }
-        switch(descriptorType){
-        case 0:
-            desc = new JSONDescriptor<SearchEngine<EdgeData, StaticGraph<EdgeData> > >();
+        auto iter = descriptor_table.find(route_parameters.output_format);
+        unsigned descriptor_type = (iter != descriptor_table.end() ? iter->second : 0);
 
-            break;
+        descriptor_config.zoom_level = route_parameters.zoom_level;
+        descriptor_config.instructions = route_parameters.print_instructions;
+        descriptor_config.geometry = route_parameters.geometry;
+        descriptor_config.encode_geometry = route_parameters.compression;
+
+        std::shared_ptr<BaseDescriptor<DataFacadeT>> descriptor;
+        switch (descriptor_type)
+        {
+        // case 0:
+        //     descriptor = std::make_shared<JSONDescriptor<DataFacadeT>>();
+        //     break;
         case 1:
-            desc = new GPXDescriptor<SearchEngine<EdgeData, StaticGraph<EdgeData> > >();
-
+            descriptor = std::make_shared<GPXDescriptor<DataFacadeT>>(facade);
             break;
+        // case 2:
+        //      descriptor = std::make_shared<GEOJSONDescriptor<DataFacadeT>>();
+        //      break;
         default:
-            desc = new JSONDescriptor<SearchEngine<EdgeData, StaticGraph<EdgeData> > >();
-
+            descriptor = std::make_shared<JSONDescriptor<DataFacadeT>>(facade);
             break;
         }
 
-        PhantomNodes phantomNodes;
-        phantomNodes.startPhantom = rawRoute.segmentEndCoordinates[0].startPhantom;
-//        INFO("Start location: " << phantomNodes.startPhantom.location)
-        phantomNodes.targetPhantom = rawRoute.segmentEndCoordinates[rawRoute.segmentEndCoordinates.size()-1].targetPhantom;
-//        INFO("TargetLocation: " << phantomNodes.targetPhantom.location);
-//        INFO("Number of segments: " << rawRoute.segmentEndCoordinates.size());
-        desc->SetConfig(descriptorConfig);
-
-        desc->Run(reply, rawRoute, phantomNodes, *searchEngine, distance);
-        if("" != JSONParameter) {
-            reply.content += ")\n";
-        }
-        reply.headers.resize(3);
-        reply.headers[0].name = "Content-Length";
-        std::string tmp;
-        intToString(reply.content.size(), tmp);
-        reply.headers[0].value = tmp;
-        switch(descriptorType){
-        case 0:
-            if("" != JSONParameter){
-                reply.headers[1].name = "Content-Type";
-                reply.headers[1].value = "text/javascript";
-                reply.headers[2].name = "Content-Disposition";
-                reply.headers[2].value = "attachment; filename=\"route.js\"";
-            } else {
-                reply.headers[1].name = "Content-Type";
-                reply.headers[1].value = "application/x-javascript";
-                reply.headers[2].name = "Content-Disposition";
-                reply.headers[2].value = "attachment; filename=\"route.json\"";
-            }
-
-            break;
-        case 1:
-            reply.headers[1].name = "Content-Type";
-            reply.headers[1].value = "application/gpx+xml; charset=UTF-8";
-            reply.headers[2].name = "Content-Disposition";
-            reply.headers[2].value = "attachment; filename=\"route.gpx\"";
-
-            break;
-        default:
-            if("" != JSONParameter){
-                reply.headers[1].name = "Content-Type";
-                reply.headers[1].value = "text/javascript";
-                reply.headers[2].name = "Content-Disposition";
-                reply.headers[2].value = "attachment; filename=\"route.js\"";
-            } else {
-                reply.headers[1].name = "Content-Type";
-                reply.headers[1].value = "application/x-javascript";
-                reply.headers[2].name = "Content-Disposition";
-                reply.headers[2].value = "attachment; filename=\"route.json\"";
-            }
-
-            break;
-        }
-
-        DELETE( desc );
-        return;
+        PhantomNodes phantom_nodes;
+        phantom_nodes.source_phantom = raw_route.segment_end_coordinates.front().source_phantom;
+        phantom_nodes.target_phantom = raw_route.segment_end_coordinates.back().target_phantom;
+        descriptor->SetConfig(descriptor_config);
+        TIMER_START(descriptor);
+        descriptor->Run(raw_route, phantom_nodes, reply);
+        TIMER_STOP(descriptor);
+        SimpleLogger().Write() << "descriptor took " << TIMER_MSEC(descriptor) << "ms";
     }
-private:
-    inline bool checkCoord(const _Coordinate & c) {
-        if(c.lat > 90*100000 || c.lat < -90*100000 || c.lon > 180*100000 || c.lon <-180*100000) {
-            return false;
-        }
-        return true;
-    }
+
+  private:
+    std::string descriptor_string;
+    DataFacadeT *facade;
 };
 
-
-#endif /* VIAROUTEPLUGIN_H_ */
+#endif // VIA_ROUTE_PLUGIN_H

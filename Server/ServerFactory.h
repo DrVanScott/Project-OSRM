@@ -1,85 +1,50 @@
 /*
-    open source routing machine
-    Copyright (C) Dennis Luxen, 2010
 
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU AFFERO General Public License as published by
-the Free Software Foundation; either version 3 of the License, or
-any later version.
+Copyright (c) 2013, Project OSRM, Dennis Luxen, others
+All rights reserved.
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
-You should have received a copy of the GNU Affero General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-or see http://www.gnu.org/licenses/agpl.txt.
+Redistributions of source code must retain the above copyright notice, this list
+of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this
+list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
 
- Created on: 26.11.2010
- Author: dennis
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
- */
+*/
 
-#ifndef SERVERFACTORY_H_
-#define SERVERFACTORY_H_
-
-#include <cstdlib>
+#ifndef SERVER_FACTORY_H
+#define SERVER_FACTORY_H
 
 #include "Server.h"
-#include "ServerConfiguration.h"
+#include "../Util/OpenMPWrapper.h"
+#include "../Util/SimpleLogger.h"
+#include "../Util/StringUtil.h"
 
-#include "../Util/InputFileUtil.h"
+#include <zlib.h>
 
-typedef http::Server Server;
-
-struct ServerFactory {
-	static Server * CreateServer(ServerConfiguration& serverConfig) {
-
-		if(!testDataFile(serverConfig.GetParameter("nodesData").c_str())) {
-			std::cerr << "[error] nodes file not found" << std::endl;
-			exit(-1);
-		}
-
-		if(!testDataFile(serverConfig.GetParameter("hsgrData").c_str())) {
-			std::cerr << "[error] hsgr file not found" << std::endl;
-			exit(-1);
-		}
-
-		if(!testDataFile(serverConfig.GetParameter("namesData").c_str())) {
-			std::cerr << "[error] names file not found" << std::endl;
-			exit(-1);
-		}
-
-		if(!testDataFile(serverConfig.GetParameter("ramIndex").c_str())) {
-			std::cerr << "[error] ram index file not found" << std::endl;
-			exit(-1);
-		}
-
-		if(!testDataFile(serverConfig.GetParameter("fileIndex").c_str())) {
-			std::cerr << "[error] file index file not found" << std::endl;
-			exit(-1);
-		}
-
-		unsigned threads = omp_get_num_procs();
-		if(serverConfig.GetParameter("IP") == "")
-			serverConfig.SetParameter("IP", "0.0.0.0");
-		if(serverConfig.GetParameter("Port") == "")
-			serverConfig.SetParameter("Port", "5000");
-
-		if(atoi(serverConfig.GetParameter("Threads").c_str()) != 0 && (unsigned)atoi(serverConfig.GetParameter("Threads").c_str()) <= threads)
-			threads = atoi( serverConfig.GetParameter("Threads").c_str() );
-
-		std::cout << "[server] http 1.1 compression handled by zlib version " << zlibVersion() << std::endl;
-		Server * server = new Server(serverConfig.GetParameter("IP"), serverConfig.GetParameter("Port"), threads);
-		return server;
-	}
-
-	static Server * CreateServer(const char * iniFile) {
-		ServerConfiguration serverConfig(iniFile);
-		return CreateServer(serverConfig);
-	}
+struct ServerFactory
+{
+    ServerFactory() = delete;
+    ServerFactory(const ServerFactory &) = delete;
+    static Server *CreateServer(std::string &ip_address, int ip_port, int threads)
+    {
+        SimpleLogger().Write() << "http 1.1 compression handled by zlib version " << zlibVersion();
+        std::string port_stream = IntToString(ip_port);
+        return new Server(ip_address, port_stream, std::min(omp_get_num_procs(), threads));
+    }
 };
 
-#endif /* SERVERFACTORY_H_ */
+#endif // SERVER_FACTORY_H

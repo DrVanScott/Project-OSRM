@@ -1,83 +1,180 @@
 /*
-    open source routing machine
-    Copyright (C) Dennis Luxen, 2010
 
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU AFFERO General Public License as published by
-the Free Software Foundation; either version 3 of the License, or
-any later version.
+Copyright (c) 2013, Project OSRM, Dennis Luxen, others
+All rights reserved.
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
-You should have received a copy of the GNU Affero General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-or see http://www.gnu.org/licenses/agpl.txt.
- */
+Redistributions of source code must retain the above copyright notice, this list
+of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this
+list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
 
-#ifndef PHANTOMNODES_H_
-#define PHANTOMNODES_H_
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include "ExtractorStructs.h"
+*/
 
-struct PhantomNode {
-    PhantomNode() : edgeBasedNode(UINT_MAX), nodeBasedEdgeNameID(UINT_MAX), weight1(INT_MAX), weight2(INT_MAX), ratio(0.) {}
-    NodeID edgeBasedNode;
-    unsigned nodeBasedEdgeNameID;
-    int weight1;
-    int weight2;
-    double ratio;
-    _Coordinate location;
-    void Reset() {
-        edgeBasedNode = UINT_MAX;
-        nodeBasedEdgeNameID = UINT_MAX;
-        weight1 = INT_MAX;
-        weight2 = INT_MAX;
-        ratio = 0.;
+#ifndef PHANTOM_NODES_H
+#define PHANTOM_NODES_H
+
+#include <osrm/Coordinate.h>
+#include "../Util/SimpleLogger.h"
+#include "../typedefs.h"
+
+struct PhantomNode
+{
+    PhantomNode() :
+        forward_node_id(SPECIAL_NODEID),
+        reverse_node_id(SPECIAL_NODEID),
+        name_id(std::numeric_limits<unsigned>::max()),
+        forward_weight(INVALID_EDGE_WEIGHT),
+        reverse_weight(INVALID_EDGE_WEIGHT),
+        forward_offset(0),
+        reverse_offset(0),
+        packed_geometry_id(SPECIAL_EDGEID),
+        fwd_segment_position(0)
+    { }
+
+    NodeID forward_node_id;
+    NodeID reverse_node_id;
+    unsigned name_id;
+    int forward_weight;
+    int reverse_weight;
+    int forward_offset;
+    int reverse_offset;
+    unsigned packed_geometry_id;
+    FixedPointCoordinate location;
+    unsigned short fwd_segment_position;
+
+    int GetForwardWeightPlusOffset() const
+    {
+        if (SPECIAL_NODEID == forward_node_id)
+        {
+            return 0;
+        }
+        const int result = (forward_offset + forward_weight);
+        return result;
+    }
+
+    int GetReverseWeightPlusOffset() const
+    {
+        if (SPECIAL_NODEID == reverse_node_id)
+        {
+            return 0;
+        }
+        const int result = (reverse_offset + reverse_weight);
+        return result;
+    }
+
+    void Reset()
+    {
+        forward_node_id = SPECIAL_NODEID;
+        name_id = SPECIAL_NODEID;
+        forward_weight = INVALID_EDGE_WEIGHT;
+        reverse_weight = INVALID_EDGE_WEIGHT;
+        forward_offset = 0;
+        reverse_offset = 0;
         location.Reset();
     }
-    bool isBidirected() const {
-        return weight2 != INT_MAX;
+
+    bool isBidirected() const
+    {
+        return (forward_node_id != SPECIAL_NODEID) &&
+               (reverse_node_id != SPECIAL_NODEID);
+    }
+
+    bool IsCompressed() const
+    {
+        return (forward_offset != 0) || (reverse_offset != 0);
+    }
+
+    bool isValid(const unsigned numberOfNodes) const
+    {
+        return
+            location.isValid() &&
+            (
+                (forward_node_id < numberOfNodes) ||
+                (reverse_node_id < numberOfNodes)
+            ) &&
+            (
+                (forward_weight != INVALID_EDGE_WEIGHT) ||
+                (reverse_weight != INVALID_EDGE_WEIGHT)
+            ) &&
+            (name_id != std::numeric_limits<unsigned>::max()
+        );
+    }
+
+    bool isValid() const
+    {
+        return location.isValid() &&
+               (name_id != std::numeric_limits<unsigned>::max());
+    }
+
+    bool operator==(const PhantomNode & other) const
+    {
+        return location == other.location;
     }
 };
 
-struct PhantomNodes {
-    PhantomNode startPhantom;
-    PhantomNode targetPhantom;
-    void Reset() {
-        startPhantom.Reset();
-        targetPhantom.Reset();
+struct PhantomNodes
+{
+    PhantomNode source_phantom;
+    PhantomNode target_phantom;
+
+    void Reset()
+    {
+        source_phantom.Reset();
+        target_phantom.Reset();
     }
 
-    bool PhantomsAreOnSameNodeBasedEdge() const {
-        return (startPhantom.edgeBasedNode == targetPhantom.edgeBasedNode);
+    bool PhantomsAreOnSameNodeBasedEdge() const
+    {
+        return (source_phantom.forward_node_id == target_phantom.forward_node_id);
     }
 
-    bool AtLeastOnePhantomNodeIsUINTMAX() const {
-        return !(startPhantom.edgeBasedNode == UINT_MAX || targetPhantom.edgeBasedNode == UINT_MAX);
+    bool AtLeastOnePhantomNodeIsInvalid() const
+    {
+        return ((source_phantom.forward_node_id == SPECIAL_NODEID) && (source_phantom.reverse_node_id == SPECIAL_NODEID)) ||
+               ((target_phantom.forward_node_id == SPECIAL_NODEID) && (target_phantom.reverse_node_id == SPECIAL_NODEID));
+    }
+
+    bool PhantomNodesHaveEqualLocation() const
+    {
+        return source_phantom == target_phantom;
     }
 };
 
-inline std::ostream& operator<<(std::ostream &out, const PhantomNodes & pn){
-    out << "Node1: " << pn.startPhantom.edgeBasedNode << std::endl;
-    out << "Node2: " << pn.targetPhantom.edgeBasedNode << std::endl;
-    out << "startCoord: " << pn.startPhantom.location << std::endl;
-    out << "targetCoord: " << pn.targetPhantom.location << std::endl;
+inline std::ostream& operator<<(std::ostream &out, const PhantomNodes & pn)
+{
+    out << "source_coord: " << pn.source_phantom.location        << "\n";
+    out << "target_coord: " << pn.target_phantom.location        << std::endl;
     return out;
 }
 
-inline std::ostream& operator<<(std::ostream &out, const PhantomNode & pn){
-
+inline std::ostream& operator<<(std::ostream &out, const PhantomNode & pn)
+{
+    out <<  "node1: " << pn.forward_node_id      << ", " <<
+            "node2: " << pn.reverse_node_id      << ", " <<
+            "name: "  << pn.name_id              << ", " <<
+            "fwd-w: " << pn.forward_weight       << ", " <<
+            "rev-w: " << pn.reverse_weight       << ", " <<
+            "fwd-o: " << pn.forward_offset       << ", " <<
+            "rev-o: " << pn.reverse_offset       << ", " <<
+            "geom: "  << pn.packed_geometry_id   << ", " <<
+            "pos: "   << pn.fwd_segment_position << ", " <<
+            "loc: "   << pn.location;
     return out;
 }
 
-struct NodesOfEdge {
-    NodeID edgeBasedNode;
-    double ratio;
-    _Coordinate projectedPoint;
-};
-
-#endif /* PHANTOMNODES_H_ */
+#endif // PHANTOM_NODES_H
